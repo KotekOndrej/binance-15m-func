@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 
 import azure.functions as func
 import requests
+from requests.exceptions import RequestException
 from dateutil import parser as dateparser
 
 from azure.storage.blob import (
@@ -25,7 +26,6 @@ logger = logging.getLogger("fetch_klines")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-# ---- Pomocné funkce ----
 def get_env(name: str, default: str = None, required: bool = False) -> str:
     val = os.getenv(name, default)
     if required and (val is None or str(val).strip() == ""):
@@ -42,19 +42,31 @@ def floor_to_interval(dt: datetime, minutes: int) -> datetime:
     m = (dt.minute // minutes) * minutes
     return dt.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=m)
 
+# ---- Robustní HTTP volání na Binance ----
 def binance_get(url: str, params: dict, max_attempts: int = 6):
     backoff = 0.5
+    last_err = None
     for attempt in range(1, max_attempts + 1):
-        r = requests.get(url, params=params, timeout=30)
-        if r.status_code == 200:
-            return r.json()
-        if r.status_code in (418, 429) or 500 <= r.status_code < 600:
-            logger.warning(f"Binance {r.status_code} attempt {attempt}: {r.text[:200]}")
-            if attempt == max_attempts:
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (418, 429) or 500 <= r.status_code < 600:
+                logger.warning(f"Binance {r.status_code} attempt {attempt}: {r.text[:200]}")
+                last_err = RuntimeError(f"Binance API error {r.status_code}: {r.text}")
+            else:
+                # jiné HTTP chyby – bez retry
                 raise RuntimeError(f"Binance API error {r.status_code}: {r.text}")
-            time.sleep(backoff); backoff *= 2
-            continue
-        raise RuntimeError(f"Binance API error {r.status_code}: {r.text}")
+        except RequestException as e:
+            # zachytí DNS/SSL/timeout/connection reset atd.
+            logger.warning(f"Binance RequestException on attempt {attempt}: {e}")
+            last_err = e
+        # backoff, pokud budou další pokusy
+        if attempt < max_attempts:
+            time.sleep(backoff)
+            backoff *= 2
+    # po vyčerpání pokusů
+    raise (last_err or RuntimeError("Unknown Binance error"))
 
 def fetch_klines(base_url: str, symbol: str, start_ms: int, end_ms: int, limit: int = BINANCE_LIMIT):
     url = f"{base_url}/api/v3/klines"
@@ -70,7 +82,6 @@ import base64, secrets
 def _ensure_container(container: ContainerClient):
     try:
         container.create_container()
-        logger.info(f"Container '{container.container_name}' created.")
     except ResourceExistsError:
         pass
 
@@ -82,34 +93,19 @@ def _blob_exists(blob: BlobClient) -> bool:
         return False
 
 def _create_block_blob_with_header(blob: BlobClient, header_line: str):
-    # první upload vytvoří block blob s hlavičkou
     blob.upload_blob(header_line.encode("utf-8"), overwrite=True)
 
 def _append_block_blob(blob: BlobClient, payload_bytes: bytes):
-    """
-    Přidá nový blok do Block Blobu:
-    - stáhne seznam committed bloků
-    - vystageuje nový blok s unikátním ID
-    - commitne staré + nový
-    """
-    # 1) načti dosavadní committed blocky
     bl = blob.get_block_list(block_list_type="committed")
     committed_ids = [b.id for b in (bl.committed_blocks or [])]
-
-    # 2) vygeneruj ID pro nový blok (base64)
     new_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-
-    # 3) pošli blok
     blob.stage_block(block_id=new_id, data=payload_bytes)
-
-    # 4) commitni staré + nový
     new_list = [BlobBlock(block_id=i) for i in committed_ids] + [BlobBlock(block_id=new_id)]
     blob.commit_block_list(new_list)
 
 def kline_to_csv_line(k):
     return ",".join([str(k[i]) for i in range(12)]) + "\n"
 
-# ---- Hlavní funkce ----
 def main(mytimer: func.TimerRequest) -> None:
     start_exec = time.time()
 
@@ -140,20 +136,19 @@ def main(mytimer: func.TimerRequest) -> None:
     if not _blob_exists(blob):
         _create_block_blob_with_header(blob, header)
 
-    # Najdi start_ms z tailu (jinak START_DATE_UTC)
+    # Najdi start_ms
     start_ms = None
     try:
         props = blob.get_blob_properties()
         size = props.size or 0
         if size > 0:
-            # stáhni poslední kus pro zjištění posledního řádku
             chunk = blob.download_blob(offset=max(0, size - 65536), length=65536)\
                         .readall().decode("utf-8", errors="ignore")
             lines = [ln for ln in chunk.splitlines() if ln.strip()]
             if lines:
                 parts = lines[-1].split(",")
                 if len(parts) >= 7 and parts[0].isdigit() and parts[6].isdigit():
-                    last_close_ms = int(parts[6])  # closeTime
+                    last_close_ms = int(parts[6])
                     start_ms = last_close_ms + 1
     except Exception as e:
         logger.warning(f"Tail parse failed: {e}")
@@ -168,7 +163,17 @@ def main(mytimer: func.TimerRequest) -> None:
 
     logger.info(f"Downloading {symbol} 15m klíny from {from_ms(start_ms)} to {from_ms(target_end_ms)}")
 
-    # Stahování a „append“ s hlídáním času běhu
+    # --- PRE-FLIGHT PING NA BINANCE (jasná diagnostika sítě/SSL) ---
+    try:
+        ping = requests.get(f"{base_url}/api/v3/ping", timeout=15)
+        logger.info(f"Binance ping status={ping.status_code}, body={ping.text[:120]}")
+        if ping.status_code != 200:
+            raise RuntimeError(f"Ping failed {ping.status_code}: {ping.text}")
+    except RequestException as e:
+        logger.error(f"Binance ping RequestException: {e}")
+        raise
+
+    # Stahování s hlídáním runtime
     fetched_total = 0
     while start_ms <= target_end_ms:
         if time.time() - start_exec > MAX_RUNTIME_SEC:
@@ -178,7 +183,12 @@ def main(mytimer: func.TimerRequest) -> None:
         batch_window_ms = BINANCE_LIMIT * INTERVAL_MIN * 60 * 1000
         end_ms = min(start_ms + batch_window_ms - 1, target_end_ms)
 
-        klines = fetch_klines(base_url, symbol, start_ms, end_ms, BINANCE_LIMIT)
+        try:
+            klines = fetch_klines(base_url, symbol, start_ms, end_ms, BINANCE_LIMIT)
+        except Exception as e:
+            logger.error(f"Binance fetch error: {e}")
+            raise
+
         if not klines:
             start_ms += INTERVAL_MIN * 60 * 1000
             time.sleep(SLEEP_SEC)
