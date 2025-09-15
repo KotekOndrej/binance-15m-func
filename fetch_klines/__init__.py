@@ -15,7 +15,7 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 BINANCE_LIMIT = 1000
 INTERVAL_MIN = 15
 SLEEP_SEC = 0.2
-MAX_RUNTIME_SEC = 8 * 60  # bezpečná mez (10 min je hard limit na Consumption)
+MAX_RUNTIME_SEC = 8 * 60  # bezpečná mez (10 min hard)
 
 logger = logging.getLogger("fetch_klines")
 if not logger.handlers:
@@ -51,22 +51,17 @@ def binance_get(url: str, params: dict, max_attempts: int = 6):
                 logger.warning(f"Binance {r.status_code} attempt {attempt}: {r.text[:200]}")
                 last_err = RuntimeError(f"Binance API error {r.status_code}: {r.text}")
             else:
-                # jiné HTTP chyby – bez retry
                 raise RuntimeError(f"Binance API error {r.status_code}: {r.text}")
         except RequestException as e:
             logger.warning(f"Binance RequestException attempt {attempt}: {e}")
             last_err = e
         if attempt < max_attempts:
-            time.sleep(backoff)
-            backoff *= 2
+            time.sleep(backoff); backoff *= 2
     raise (last_err or RuntimeError("Unknown Binance error"))
 
 def fetch_klines(base_url: str, symbol: str, start_ms: int, end_ms: int, limit: int = BINANCE_LIMIT):
     url = f"{base_url}/api/v3/klines"
-    params = {
-        "symbol": symbol, "interval": "15m", "limit": limit,
-        "startTime": start_ms, "endTime": end_ms
-    }
+    params = {"symbol": symbol, "interval": "15m", "limit": limit, "startTime": start_ms, "endTime": end_ms}
     return binance_get(url, params)
 
 # ---- Block Blob „append“ (stage/commit) ----
@@ -87,10 +82,7 @@ def _create_block_blob_with_header(blob: BlobClient, header_line: str):
     blob.upload_blob(header_line.encode("utf-8"), overwrite=True)
 
 def _ensure_block_blob(blob: BlobClient):
-    """
-    Pokud blob není BlockBlob (např. byl vytvořen dříve jako AppendBlob),
-    stáhne obsah a znovu ho nahraje jako BlockBlob.
-    """
+    """Pokud blob není BlockBlob (např. AppendBlob), přenahrát ho jako BlockBlob."""
     try:
         props = blob.get_blob_properties()
         blob_type = getattr(props, "blob_type", None)
@@ -99,22 +91,41 @@ def _ensure_block_blob(blob: BlobClient):
             blob.upload_blob(data, overwrite=True)  # re-upload jako BlockBlob
             logger.info(f"Blob type converted to BlockBlob (size={len(data)} bytes).")
     except ResourceNotFoundError:
-        # neexistuje – nic
         pass
 
+def _extract_committed_ids(block_list_obj):
+    """
+    Vrátí list ID (base64) committed bloků z různých tvarů návratu get_block_list:
+    - BlobBlockList s .committed_blocks
+    - tuple (committed, uncommitted)
+    - příp. list už BlobBlocků
+    """
+    committed = []
+    if hasattr(block_list_obj, "committed_blocks"):
+        committed = block_list_obj.committed_blocks or []
+    elif isinstance(block_list_obj, (list, tuple)):
+        if isinstance(block_list_obj, tuple) and len(block_list_obj) > 0:
+            committed = block_list_obj[0] or []
+        else:
+            committed = block_list_obj
+    else:
+        committed = []
+
+    ids = []
+    for b in committed:
+        bid = getattr(b, "id", None) or getattr(b, "name", None)
+        if bid:
+            ids.append(bid)
+    return ids
+
 def _append_block_blob(blob: BlobClient, payload_bytes: bytes):
-    """
-    Přidá data na konec Block Blobu:
-      - načte committed blocky
-      - vystageuje nový blok s unikátním ID
-      - commitne staré + nový blok
-    """
+    """Přidá data na konec Block Blobu přes stage/commit; robustní napříč verzemi SDK."""
     from azure.storage.blob import BlobBlock
     import base64, secrets
 
     try:
         bl = blob.get_block_list(block_list_type="committed")
-        committed_ids = [b.id for b in (bl.committed_blocks or [])]
+        committed_ids = _extract_committed_ids(bl)
 
         new_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
         logger.info(f"Staging new block id={new_id} size={len(payload_bytes)}")
