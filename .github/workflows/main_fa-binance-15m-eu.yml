@@ -27,7 +27,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-
+      - name: Clean previous packages
+        run: rm -rf .python_packages
+        
       - name: Install dependencies into .python_packages
         working-directory: ${{ env.APP_PATH }}
         run: |
@@ -77,3 +79,4 @@ jobs:
         with:
           app-name: 'fa-binance-15m-eu'
           package: 'release.zip'
+
