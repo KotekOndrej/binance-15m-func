@@ -5,6 +5,7 @@ import logging
 import requests
 import azure.functions as func
 from azure.storage.blob import BlobServiceClient, ContainerClient, AppendBlobClient
+from azure.core.exceptions import ResourceExistsError  # <- DOPLNĚNO
 from dateutil import parser as dateparser
 
 BINANCE_LIMIT = 1000  # max klínů na request
@@ -46,9 +47,11 @@ def ensure_append_blob(client: AppendBlobClient, include_header: bool) -> None:
             header = "openTime,open,high,low,close,volume,closeTime,quoteVolume,numTrades,takerBuyBase,takerBuyQuote,ignore\n"
             client.append_block(header.encode("utf-8"))
     except Exception:
-        pass  # existuje
+        # pokud už existuje, ignoruj
+        pass
 
 def kline_to_csv_line(k):
+    # [ openTime, open, high, low, close, volume, closeTime, quoteAssetVolume, trades, takerBuyBase, takerBuyQuote, ignore ]
     return ",".join([
         str(k[0]), str(k[1]), str(k[2]), str(k[3]), str(k[4]), str(k[5]),
         str(k[6]), str(k[7]), str(k[8]), str(k[9]), str(k[10]), str(k[11])
@@ -58,6 +61,7 @@ def main(mytimer: func.TimerRequest) -> None:
     logger = logging.getLogger("fetch_klines")
     logger.setLevel(logging.INFO)
 
+    # ---- Env vars ----
     symbol = get_env("BINANCE_SYMBOL", required=True)
     interval = get_env("BINANCE_INTERVAL", "15m")
     if interval != "15m":
@@ -67,30 +71,42 @@ def main(mytimer: func.TimerRequest) -> None:
     start_date_str = get_env("START_DATE_UTC", "2020-01-01T00:00:00Z")
     base_url = get_env("BINANCE_BASE_URL", "https://api.binance.com")
 
+    # ---- Poslední kompletně uzavřená 15m svíčka ----
     now_utc = datetime.now(timezone.utc)
     last_closed = floor_to_interval(now_utc, 15) - timedelta(minutes=15)
 
+    # ---- Blob klienti ----
     conn_str = get_env("AzureWebJobsStorage", required=True)
     blob_service = BlobServiceClient.from_connection_string(conn_str)
     container: ContainerClient = blob_service.get_container_client(container_name)
-    container.create_container(exist_ok=True)
+
+    # Vytvoř kontejner, pokud neexistuje (SPRAVENÁ ČÁST)
+    try:
+        container.create_container()
+    except ResourceExistsError:
+        pass
+
     append_blob: AppendBlobClient = container.get_append_blob_client(blob_name)
 
+    # Vytvoř blob (pokud neexistuje), přidej hlavičku
     ensure_append_blob(append_blob, include_header=True)
 
+    # ---- Zjisti startovací timestamp (ms) ----
     start_ms = None
     try:
         props = append_blob.get_blob_properties()
         size = props.size or 0
         if size > 0:
-            chunk = append_blob.download_blob(offset=max(0, size - 65536), length=65536)\
-                               .readall().decode("utf-8", errors="ignore")
+            chunk = append_blob.download_blob(
+                offset=max(0, size - 65536),
+                length=65536
+            ).readall().decode("utf-8", errors="ignore")
             lines = [ln for ln in chunk.splitlines() if ln.strip()]
             if lines:
                 last_line = lines[-1]
                 parts = last_line.split(",")
                 if len(parts) >= 7 and parts[0].isdigit() and parts[6].isdigit():
-                    last_close_ms = int(parts[6])
+                    last_close_ms = int(parts[6])  # closeTime
                     start_ms = last_close_ms + 1
     except Exception as e:
         logger.warning(f"Could not infer last closeTime from blob: {e}")
@@ -99,6 +115,7 @@ def main(mytimer: func.TimerRequest) -> None:
         start_dt = dateparser.isoparse(start_date_str).astimezone(timezone.utc)
         start_ms = to_ms(start_dt)
 
+    # ---- Cílový konec: closeTime poslední uzavřené svíčky ----
     target_end_ms = to_ms(last_closed) + (15 * 60 * 1000) - 1
     if start_ms > target_end_ms:
         logger.info("Data jsou aktuální – není co stahovat.")
@@ -106,6 +123,7 @@ def main(mytimer: func.TimerRequest) -> None:
 
     logger.info(f"Downloading {symbol} 15m klíny from {from_ms(start_ms)} to {from_ms(target_end_ms)}")
 
+    # ---- Smyčka přes dávky (max 1000 klínů) ----
     fetched_total = 0
     while start_ms <= target_end_ms:
         batch_window_ms = BINANCE_LIMIT * 15 * 60 * 1000
@@ -114,12 +132,13 @@ def main(mytimer: func.TimerRequest) -> None:
         klines = fetch_klines(base_url, symbol, "15m", start_ms, end_ms, BINANCE_LIMIT)
 
         if not klines:
+            # žádná data – posuň se o 1 interval, ať nezacyklíme
             start_ms += 15 * 60 * 1000
             continue
 
         payload_lines = []
         for k in klines:
-            if k[6] <= target_end_ms:
+            if k[6] <= target_end_ms:  # closeTime
                 payload_lines.append(kline_to_csv_line(k))
 
         if payload_lines:
@@ -131,5 +150,7 @@ def main(mytimer: func.TimerRequest) -> None:
         else:
             start_ms += 15 * 60 * 1000
 
+        # respekt k rate limitům
         time.sleep(0.2)
+
     logger.info(f"Appended {fetched_total} klínů do {container_name}/{blob_name}")
