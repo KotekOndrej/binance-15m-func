@@ -15,7 +15,7 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 BINANCE_LIMIT = 1000
 INTERVAL_MIN = 15
 SLEEP_SEC = 0.2
-MAX_RUNTIME_SEC = 8 * 60  # bezpečná mez (10 min hard)
+MAX_RUNTIME_SEC = 8 * 60  # bezpečná mez (10 min je hard limit na Consumption)
 
 logger = logging.getLogger("fetch_klines")
 if not logger.handlers:
@@ -93,12 +93,24 @@ def _ensure_block_blob(blob: BlobClient):
     except ResourceNotFoundError:
         pass
 
+def _ensure_header_present(blob: BlobClient, header_line: str):
+    """
+    Zajistí, že CSV začíná hlavičkou. Pokud chybí, přidá ji a přepíše blob.
+    """
+    try:
+        head = blob.download_blob(offset=0, length=256).readall().decode("utf-8", errors="ignore")
+        first_line = head.splitlines()[0] if head else ""
+        if not first_line.startswith(header_line.strip()):
+            body = blob.download_blob().readall()
+            new_body = header_line.encode("utf-8") + body
+            blob.upload_blob(new_body, overwrite=True)
+            logger.info("Header was missing -> added header and re-uploaded blob.")
+    except ResourceNotFoundError:
+        pass
+
 def _extract_committed_ids(block_list_obj):
     """
-    Vrátí list ID (base64) committed bloků z různých tvarů návratu get_block_list:
-    - BlobBlockList s .committed_blocks
-    - tuple (committed, uncommitted)
-    - příp. list už BlobBlocků
+    Vrátí list ID (base64) committed bloků z různých tvarů návratu get_block_list.
     """
     committed = []
     if hasattr(block_list_obj, "committed_blocks"):
@@ -123,20 +135,16 @@ def _append_block_blob(blob: BlobClient, payload_bytes: bytes):
     from azure.storage.blob import BlobBlock
     import base64, secrets
 
-    try:
-        bl = blob.get_block_list(block_list_type="committed")
-        committed_ids = _extract_committed_ids(bl)
+    bl = blob.get_block_list(block_list_type="committed")
+    committed_ids = _extract_committed_ids(bl)
 
-        new_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-        logger.info(f"Staging new block id={new_id} size={len(payload_bytes)}")
-        blob.stage_block(block_id=new_id, data=payload_bytes)
+    new_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+    logger.info(f"Staging new block id={new_id} size={len(payload_bytes)}")
+    blob.stage_block(block_id=new_id, data=payload_bytes)
 
-        new_list = [BlobBlock(i) for i in committed_ids] + [BlobBlock(new_id)]
-        logger.info(f"Committing block list: prev={len(committed_ids)} +1")
-        blob.commit_block_list(new_list)
-    except Exception as e:
-        logger.error(f"Block append failed: {e}")
-        raise
+    new_list = [BlobBlock(i) for i in committed_ids] + [BlobBlock(new_id)]
+    logger.info(f"Committing block list: prev={len(committed_ids)} +1")
+    blob.commit_block_list(new_list)
 
 def kline_to_csv_line(k):
     # [openTime, open, high, low, close, volume, closeTime, quoteVolume, numTrades, takerBuyBase, takerBuyQuote, ignore]
@@ -173,8 +181,9 @@ def main(mytimer: func.TimerRequest) -> None:
     if not _blob_exists(blob):
         _create_block_blob_with_header(blob, header)
 
-    # Ujisti se, že typ je BlockBlob (mohl být dříve založen jako AppendBlob)
+    # Ujisti se, že typ je BlockBlob + že hlavička je přítomná
     _ensure_block_blob(blob)
+    _ensure_header_present(blob, header)
 
     # Zjisti start_ms z tailu CSV, jinak ze START_DATE_UTC
     start_ms = None
