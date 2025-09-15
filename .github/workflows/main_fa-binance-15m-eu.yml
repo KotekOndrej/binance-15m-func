@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  APP_PATH: 'fetch_klines'   # <<< podsložka s funkcí
+  APP_PATH: '.'            # nasazujeme kořen repa
   PYTHON_VERSION: '3.11'
 
 jobs:
@@ -15,27 +15,24 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies into .python_packages (in subfolder)
+      - name: Install dependencies into .python_packages (in APP_PATH)
         working-directory: ${{ env.APP_PATH }}
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt --target ".python_packages/lib/site-packages"
 
-      - name: Zip only the app folder
+      - name: Zip APP_PATH
         run: |
-          cd $APP_PATH
-          zip -r ../release.zip .   # zabal jen podsložku
+          cd "$APP_PATH"
+          zip -r ../release.zip .
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: python-app
           path: release.zip
@@ -47,13 +44,11 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: python-app
 
-      - name: Login to Azure
-        uses: azure/login@v2
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_16D5243E86CB475D9A92AAE811FAB73C }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_9EEC048717314A2CB4A4ECE8F2AC4DF1 }}
@@ -63,5 +58,4 @@ jobs:
         uses: Azure/functions-action@v1
         with:
           app-name: 'fa-binance-15m-eu'
-          package: 'release.zip'   # nasazujeme zip s obsahem podsložky
-
+          package: 'release.zip'
