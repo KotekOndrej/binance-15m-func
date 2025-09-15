@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  APP_PATH: 'fa-binance-15m-eu'   # <<< podsložka s funkcí
+  APP_PATH: 'fetch_klines'   # <<< podsložka s funkcí
   PYTHON_VERSION: '3.11'
 
 jobs:
@@ -64,3 +64,4 @@ jobs:
         with:
           app-name: 'fa-binance-15m-eu'
           package: 'release.zip'   # nasazujeme zip s obsahem podsložky
+
