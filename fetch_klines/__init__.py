@@ -95,23 +95,42 @@ def _ensure_block_blob(blob: BlobClient):
 
 def _ensure_header_present(blob: BlobClient, header_line: str):
     """
-    Zajistí, že CSV začíná hlavičkou. Pokud chybí, přidá ji a přepíše blob.
+    Zajistí, že CSV začíná hlavičkou "openTime,open,...".
+    Ignoruje UTF-8 BOM, \r\n vs \n i úvodní whitespace.
+    Pokud chybí, blob přepíše na: header + '\n' (pokud chybí) + původní obsah.
     """
     try:
-        head = blob.download_blob(offset=0, length=256).readall().decode("utf-8", errors="ignore")
-        first_line = head.splitlines()[0] if head else ""
-        if not first_line.startswith(header_line.strip()):
-            body = blob.download_blob().readall()
-            new_body = header_line.encode("utf-8") + body
-            blob.upload_blob(new_body, overwrite=True)
-            logger.info("Header was missing -> added header and re-uploaded blob.")
+        props = blob.get_blob_properties()
+        size = props.size or 0
+        expected = header_line.strip()
+
+        if size == 0:
+            body = (header_line if header_line.endswith("\n") else header_line + "\n").encode("utf-8")
+            blob.upload_blob(body, overwrite=True)
+            logger.info("Blob empty -> wrote header.")
+            return
+
+        head_bytes = blob.download_blob(offset=0, length=4096).readall()
+        head = head_bytes.decode("utf-8", errors="ignore")
+        head_stripped = head.lstrip("\ufeff").lstrip()
+        first_line = head_stripped.splitlines()[0] if head_stripped else ""
+
+        # už je tam správná hlavička
+        if first_line.replace("\r", "") == expected:
+            return
+
+        # chybí → doplníme
+        full = blob.download_blob().readall()
+        prefix = (header_line if header_line.endswith("\n") else header_line + "\n").encode("utf-8")
+        new_body = prefix + full
+        blob.upload_blob(new_body, overwrite=True)
+        logger.info(f"Header missing -> added header. Old first line (preview): {first_line[:60]!r}")
     except ResourceNotFoundError:
+        # neexistuje – řeší se jinde
         pass
 
 def _extract_committed_ids(block_list_obj):
-    """
-    Vrátí list ID (base64) committed bloků z různých tvarů návratu get_block_list.
-    """
+    """Vrátí list ID (base64) committed bloků z různých tvarů návratu get_block_list."""
     committed = []
     if hasattr(block_list_obj, "committed_blocks"):
         committed = block_list_obj.committed_blocks or []
