@@ -14,7 +14,7 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 # ---- Konfigurace ----
 BINANCE_LIMIT = 1000
 SLEEP_SEC = 0.2
-MAX_RUNTIME_SEC = 8 * 60  # bezpečná mez (10 min je hard limit na Consumption)
+MAX_RUNTIME_SEC = 8 * 60  # bezpečná mez (10 min hard limit na Consumption)
 
 # Hlavičky (stará vs. nová s datetime)
 BASE_HEADER = "openTime,open,high,low,close,volume,closeTime,quoteVolume,numTrades,takerBuyBase,takerBuyQuote,ignore"
@@ -39,7 +39,7 @@ def floor_to_interval(dt: datetime, minutes: int) -> datetime:
     return dt.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=m)
 
 def interval_to_minutes(interval_str: str) -> int:
-    """Podporuje 'Xm','Xh','Xd','Xw','XM' (měsíc ~ 30d pro účely zrnění)."""
+    """Podporuje 'Xm','Xh','Xd','Xw','XM' (měsíc ~30d pro účely okna/zarovnání)."""
     if not interval_str or len(interval_str) < 2:
         raise RuntimeError(f"Invalid BINANCE_INTERVAL: {interval_str!r}")
     unit = interval_str[-1]
@@ -53,7 +53,7 @@ def interval_to_minutes(interval_str: str) -> int:
     if unit == "w":
         return val * 60 * 24 * 7
     if unit == "M":
-        return val * 60 * 24 * 30  # aproximace pro účely okna/zarovnání
+        return val * 60 * 24 * 30
     raise RuntimeError(f"Unsupported interval unit in BINANCE_INTERVAL: {interval_str!r}")
 
 # ---------- Env ----------
@@ -62,6 +62,23 @@ def get_env(name: str, default: str = None, required: bool = False) -> str:
     if required and (val is None or str(val).strip() == ""):
         raise RuntimeError(f"Missing required environment variable: {name}")
     return val
+
+def parse_symbols(env_val: str) -> list[str]:
+    if not env_val:
+        return []
+    raw = env_val.replace(";", ",").split(",")
+    # split také whitespace
+    out = []
+    for piece in raw:
+        for token in piece.strip().split():
+            if token:
+                out.append(token.upper())
+    # unikáty v pořadí
+    seen = set(); res = []
+    for s in out:
+        if s not in seen:
+            seen.add(s); res.append(s)
+    return res
 
 # ---------- Binance HTTP s retry ----------
 def binance_get(url: str, params: dict, max_attempts: int = 6):
@@ -123,7 +140,7 @@ def _ensure_block_blob_type(blob: BlobClient):
         if str(blob_type).lower() != "blockblob":
             data = blob.download_blob().readall()
             _put_full_body_as_single_block(blob, data)
-            logger.info(f"Blob type converted to BlockBlob via block-list (size={len(data)}).")
+            logger.info(f"{blob.blob_name}: Converted to BlockBlob via block-list (size={len(data)}).")
     except ResourceNotFoundError:
         pass
 
@@ -139,7 +156,7 @@ def _ensure_header_present_and_migrate(blob: BlobClient):
         size = props.size or 0
         if size == 0:
             _create_block_blob_with_header(blob, NEW_HEADER)
-            logger.info("Blob empty -> wrote NEW_HEADER (block-list).")
+            logger.info(f"{blob.blob_name}: empty -> wrote NEW_HEADER (block-list).")
             return
 
         head_bytes = blob.download_blob(offset=0, length=8192).readall()
@@ -155,7 +172,7 @@ def _ensure_header_present_and_migrate(blob: BlobClient):
             lines = full.splitlines()
             if not lines:
                 _create_block_blob_with_header(blob, NEW_HEADER)
-                logger.info("Blob had old header but no data -> wrote NEW_HEADER (block-list).")
+                logger.info(f"{blob.blob_name}: old header but no data -> wrote NEW_HEADER.")
                 return
 
             out_lines = [NEW_HEADER]
@@ -170,14 +187,14 @@ def _ensure_header_present_and_migrate(blob: BlobClient):
                     out_lines.append(ln + ",")
             new_body = ("\n".join(out_lines) + "\n").encode("utf-8")
             _put_full_body_as_single_block(blob, new_body)
-            logger.info(f"Migrated CSV BASE_HEADER -> NEW_HEADER (rows={len(out_lines)-1}).")
+            logger.info(f"{blob.blob_name}: Migrated BASE_HEADER -> NEW_HEADER (rows={len(out_lines)-1}).")
             return
 
         # Neznámý první řádek → vlož NEW_HEADER na začátek
         full = blob.download_blob().readall()
         prefix = (NEW_HEADER + "\n").encode("utf-8") if not NEW_HEADER.endswith("\n") else NEW_HEADER.encode("utf-8")
         _put_full_body_as_single_block(blob, prefix + full)
-        logger.info(f"Header missing/unknown -> prepended NEW_HEADER (block-list).")
+        logger.info(f"{blob.blob_name}: Header missing/unknown -> prepended NEW_HEADER.")
     except ResourceNotFoundError:
         pass
 
@@ -210,49 +227,43 @@ def _append_block_blob(blob: BlobClient, payload_bytes: bytes):
     committed_ids = _extract_committed_ids(bl)
 
     new_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-    logger.info(f"Staging new block id={new_id} size={len(payload_bytes)}")
+    logger.info(f"{blob.blob_name}: staging block id={new_id} size={len(payload_bytes)}")
     blob.stage_block(block_id=new_id, data=payload_bytes)
 
     new_list = [BlobBlock(i) for i in committed_ids] + [BlobBlock(new_id)]
-    logger.info(f"Committing block list: prev={len(committed_ids)} +1")
+    logger.info(f"{blob.blob_name}: committing block list: prev={len(committed_ids)} +1")
     blob.commit_block_list(new_list)
 
 def kline_to_csv_line(k):
     # [openTime, open, high, low, close, volume, closeTime, quoteVolume, numTrades, takerBuyBase, takerBuyQuote, ignore] + closeTimeISO
     return ",".join([str(k[i]) for i in range(12)] + [iso_utc(int(k[6]))]) + "\n"
 
-# ---------- Hlavní ----------
-def main(mytimer: func.TimerRequest) -> None:
-    start_exec = time.time()
+# ---------- Zpracování JEDNOHO symbolu ----------
+def process_symbol(symbol: str,
+                   interval_str: str,
+                   container: ContainerClient,
+                   blob_dir: str,
+                   blob_name_tmpl: str,
+                   start_date_str: str,
+                   base_url: str,
+                   conn_str: str,
+                   INTERVAL_MIN: int,
+                   target_end_ms: int) -> int:
+    """Stáhne a appendne data pro konkrétní symbol. Vrací počet přidaných řádků."""
+    # Sestav název blobu
+    blob_file = blob_name_tmpl.replace("{SYMBOL}", symbol).replace("{INTERVAL}", interval_str)
+    if blob_dir:
+        # hezky normalizovat lomítka
+        blob_dir_norm = blob_dir.strip("/ ")
+        blob_path = f"{blob_dir_norm}/{blob_file}"
+    else:
+        blob_path = blob_file
 
-    # Env
-    symbol = get_env("BINANCE_SYMBOL", required=True)
-    interval_str = get_env("BINANCE_INTERVAL", "15m")  # ← měň v Environment variables (1m/5m/15m/1h/…)
-    INTERVAL_MIN = interval_to_minutes(interval_str)
-    container_name = get_env("BLOB_CONTAINER", required=True)
-    # implicitně pojmenujeme CSV podle intervalu; lze přepsat BLOB_NAME
-    default_blob_name = f"{symbol}_{interval_str}.csv"
-    blob_name = get_env("BLOB_NAME", default_blob_name)
-    start_date_str = get_env("START_DATE_UTC", "2020-01-01T00:00:00Z")
-    base_url = get_env("BINANCE_BASE_URL", "https://api.binance.com")
-    conn_str = get_env("AzureWebJobsStorage", required=True)
+    blob: BlobClient = container.get_blob_client(blob_path)
 
-    # Časové okno: poslední kompletně uzavřená svíčka pro daný interval
-    now_utc = datetime.now(timezone.utc)
-    last_closed = floor_to_interval(now_utc, INTERVAL_MIN) - timedelta(minutes=INTERVAL_MIN)
-    target_end_ms = to_ms(last_closed) + (INTERVAL_MIN * 60 * 1000) - 1
-
-    # Blob klienti
-    blob_service = BlobServiceClient.from_connection_string(conn_str)
-    container = blob_service.get_container_client(container_name)
-    _ensure_container(container)
-    blob = container.get_blob_client(blob_name)
-
-    # Zajisti existenci CSV s NOVOU hlavičkou (přes block-list)
+    # Veď CSV s novou hlavičkou a správným typem
     if not _blob_exists(blob):
         _create_block_blob_with_header(blob, NEW_HEADER)
-
-    # Ujisti se, že typ je BlockBlob a že první obsah je přes block-list + migruj hlavičku
     _ensure_block_blob_type(blob)
     _ensure_header_present_and_migrate(blob)
 
@@ -272,37 +283,36 @@ def main(mytimer: func.TimerRequest) -> None:
                     last_close_ms = int(parts[6])
                     start_ms = last_close_ms + 1
     except Exception as e:
-        logger.warning(f"Tail parse failed: {e}")
+        logger.warning(f"{blob.blob_name}: tail parse failed: {e}")
 
     if start_ms is None:
         start_dt = dateparser.isoparse(start_date_str).astimezone(timezone.utc)
         start_ms = to_ms(start_dt)
 
     if start_ms > target_end_ms:
-        logger.info("Up to date – nothing to fetch.")
-        return
+        logger.info(f"{symbol}: Up to date – nothing to fetch.")
+        return 0
 
-    logger.info(f"Downloading {symbol} {interval_str} klíny from {from_ms(start_ms)} to {from_ms(target_end_ms)}")
+    logger.info(f"{symbol}: downloading {interval_str} klines from {from_ms(start_ms)} to {from_ms(target_end_ms)}")
 
-    # Pre-flight ping (diagnostika sítě/SSL)
+    # Pre-flight ping (diagnostika sítě/SSL) – jednou stačí, ale necháme i per-symbol lehký check
     try:
         ping = requests.get(f"{base_url}/api/v3/ping", timeout=15)
-        logger.info(f"Binance ping status={ping.status_code}, body={ping.text[:120]}")
         if ping.status_code != 200:
             raise RuntimeError(f"Ping failed {ping.status_code}: {ping.text}")
     except RequestException as e:
-        logger.error(f"Binance ping RequestException: {e}")
-        raise
+        raise RuntimeError(f"{symbol}: Binance ping failed: {e}") from e
 
-    # Stahování a append s hlídáním délky běhu
+    # Stahování a append
     fetched_total = 0
+    interval_ms = INTERVAL_MIN * 60 * 1000
+    start_exec = time.time()
+
     while start_ms <= target_end_ms:
         if time.time() - start_exec > MAX_RUNTIME_SEC:
-            logger.info("Reached safe runtime limit, will continue next run.")
+            logger.info(f"{symbol}: Reached safe runtime limit, will continue next run.")
             break
 
-        # velikost okna v ms pro jeden request (limit * velikost svíčky)
-        interval_ms = INTERVAL_MIN * 60 * 1000
         batch_window_ms = BINANCE_LIMIT * interval_ms
         end_ms = min(start_ms + batch_window_ms - 1, target_end_ms)
 
@@ -323,10 +333,68 @@ def main(mytimer: func.TimerRequest) -> None:
             added = len(rows)
             fetched_total += added
             start_ms = klines[-1][6] + 1
-            logger.info(f"Appended {added} rows; next start={from_ms(start_ms)}")
+            logger.info(f"{symbol}: appended {added} rows; next start={from_ms(start_ms)}")
         else:
             start_ms += interval_ms
 
-        time.sleep(SLEEP_SEC)
+        time.sleep(SLEEP_SEC)  # šetříme limity
 
-    logger.info(f"TOTAL appended: {fetched_total} rows to {container_name}/{blob_name}")
+    logger.info(f"{symbol}: TOTAL appended {fetched_total} rows -> {blob.blob_name}")
+    return fetched_total
+
+# ---------- Hlavní ----------
+def main(mytimer: func.TimerRequest) -> None:
+    # Env – MULTI SYMBOLS
+    symbols_env = get_env("BINANCE_SYMBOLS", "")
+    symbols = parse_symbols(symbols_env)
+    if not symbols:
+        # zpětná kompatibilita: BINANCE_SYMBOL (single)
+        single = get_env("BINANCE_SYMBOL", "")
+        if single:
+            symbols = [single.upper()]
+        else:
+            raise RuntimeError("Set BINANCE_SYMBOLS (e.g. 'BTCUSDT, ETHUSDT') or BINANCE_SYMBOL.")
+
+    interval_str = get_env("BINANCE_INTERVAL", "15m")
+    INTERVAL_MIN = interval_to_minutes(interval_str)
+
+    container_name = get_env("BLOB_CONTAINER", required=True)
+    blob_name_tmpl = get_env("BLOB_NAME_TEMPLATE", "{SYMBOL}_{INTERVAL}.csv")
+    blob_dir = get_env("BLOB_DIR", "")  # volitelně např. "market-data"
+    start_date_str = get_env("START_DATE_UTC", "2020-01-01T00:00:00Z")
+    base_url = get_env("BINANCE_BASE_URL", "https://api.binance.com")
+    conn_str = get_env("AzureWebJobsStorage", required=True)
+
+    # Časové okno: poslední kompletně uzavřená svíčka pro daný interval
+    now_utc = datetime.now(timezone.utc)
+    last_closed = floor_to_interval(now_utc, INTERVAL_MIN) - timedelta(minutes=INTERVAL_MIN)
+    target_end_ms = to_ms(last_closed) + (INTERVAL_MIN * 60 * 1000) - 1
+
+    # Blob klienti
+    blob_service = BlobServiceClient.from_connection_string(conn_str)
+    container = blob_service.get_container_client(container_name)
+    _ensure_container(container)
+
+    total_rows = 0
+    for idx, symbol in enumerate(symbols, start=1):
+        try:
+            added = process_symbol(
+                symbol=symbol,
+                interval_str=interval_str,
+                container=container,
+                blob_dir=blob_dir,
+                blob_name_tmpl=blob_name_tmpl,
+                start_date_str=start_date_str,
+                base_url=base_url,
+                conn_str=conn_str,
+                INTERVAL_MIN=INTERVAL_MIN,
+                target_end_ms=target_end_ms,
+            )
+            total_rows += added
+        except Exception as e:
+            logger.error(f"{symbol}: FAILED -> {e}")
+
+        # malé zpoždění mezi symboly kvůli limitům
+        time.sleep(0.2)
+
+    logger.info(f"ALL DONE: symbols={len(symbols)}, total_rows_appended={total_rows}")
