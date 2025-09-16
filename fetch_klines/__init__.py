@@ -13,7 +13,6 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 
 # ---- Konfigurace ----
 BINANCE_LIMIT = 1000
-INTERVAL_MIN = 15
 SLEEP_SEC = 0.2
 MAX_RUNTIME_SEC = 8 * 60  # bezpečná mez (10 min je hard limit na Consumption)
 
@@ -38,6 +37,24 @@ def iso_utc(ms: int) -> str:
 def floor_to_interval(dt: datetime, minutes: int) -> datetime:
     m = (dt.minute // minutes) * minutes
     return dt.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=m)
+
+def interval_to_minutes(interval_str: str) -> int:
+    """Podporuje 'Xm','Xh','Xd','Xw','XM' (měsíc ~ 30d pro účely zrnění)."""
+    if not interval_str or len(interval_str) < 2:
+        raise RuntimeError(f"Invalid BINANCE_INTERVAL: {interval_str!r}")
+    unit = interval_str[-1]
+    val = int(interval_str[:-1])
+    if unit == "m":
+        return val
+    if unit == "h":
+        return val * 60
+    if unit == "d":
+        return val * 60 * 24
+    if unit == "w":
+        return val * 60 * 24 * 7
+    if unit == "M":
+        return val * 60 * 24 * 30  # aproximace pro účely okna/zarovnání
+    raise RuntimeError(f"Unsupported interval unit in BINANCE_INTERVAL: {interval_str!r}")
 
 # ---------- Env ----------
 def get_env(name: str, default: str = None, required: bool = False) -> str:
@@ -67,9 +84,9 @@ def binance_get(url: str, params: dict, max_attempts: int = 6):
             time.sleep(backoff); backoff *= 2
     raise (last_err or RuntimeError("Unknown Binance error"))
 
-def fetch_klines(base_url: str, symbol: str, start_ms: int, end_ms: int, limit: int = BINANCE_LIMIT):
+def fetch_klines(base_url: str, symbol: str, interval_str: str, start_ms: int, end_ms: int, limit: int = BINANCE_LIMIT):
     url = f"{base_url}/api/v3/klines"
-    params = {"symbol": symbol, "interval": "15m", "limit": limit, "startTime": start_ms, "endTime": end_ms}
+    params = {"symbol": symbol, "interval": interval_str, "limit": limit, "startTime": start_ms, "endTime": end_ms}
     return binance_get(url, params)
 
 # ---------- Block Blob append (jen stage+commit, nikdy upload_blob) ----------
@@ -95,7 +112,6 @@ def _put_full_body_as_single_block(blob: BlobClient, data_bytes: bytes):
     blob.commit_block_list([BlobBlock(block_id)])
 
 def _create_block_blob_with_header(blob: BlobClient, header_line: str):
-    # založ blob jako block-list (hlavička je 1. blok)
     line = header_line if header_line.endswith("\n") else header_line + "\n"
     _put_full_body_as_single_block(blob, line.encode("utf-8"))
 
@@ -211,16 +227,17 @@ def main(mytimer: func.TimerRequest) -> None:
 
     # Env
     symbol = get_env("BINANCE_SYMBOL", required=True)
-    interval = get_env("BINANCE_INTERVAL", "15m")
-    if interval != "15m":
-        raise RuntimeError(f"BINANCE_INTERVAL must be '15m', got '{interval}'")
+    interval_str = get_env("BINANCE_INTERVAL", "15m")  # ← měň v Environment variables (1m/5m/15m/1h/…)
+    INTERVAL_MIN = interval_to_minutes(interval_str)
     container_name = get_env("BLOB_CONTAINER", required=True)
-    blob_name = get_env("BLOB_NAME", f"{symbol}_15m.csv")
+    # implicitně pojmenujeme CSV podle intervalu; lze přepsat BLOB_NAME
+    default_blob_name = f"{symbol}_{interval_str}.csv"
+    blob_name = get_env("BLOB_NAME", default_blob_name)
     start_date_str = get_env("START_DATE_UTC", "2020-01-01T00:00:00Z")
     base_url = get_env("BINANCE_BASE_URL", "https://api.binance.com")
     conn_str = get_env("AzureWebJobsStorage", required=True)
 
-    # Časové okno: poslední kompletně uzavřená 15m svíčka
+    # Časové okno: poslední kompletně uzavřená svíčka pro daný interval
     now_utc = datetime.now(timezone.utc)
     last_closed = floor_to_interval(now_utc, INTERVAL_MIN) - timedelta(minutes=INTERVAL_MIN)
     target_end_ms = to_ms(last_closed) + (INTERVAL_MIN * 60 * 1000) - 1
@@ -265,7 +282,7 @@ def main(mytimer: func.TimerRequest) -> None:
         logger.info("Up to date – nothing to fetch.")
         return
 
-    logger.info(f"Downloading {symbol} 15m klíny from {from_ms(start_ms)} to {from_ms(target_end_ms)}")
+    logger.info(f"Downloading {symbol} {interval_str} klíny from {from_ms(start_ms)} to {from_ms(target_end_ms)}")
 
     # Pre-flight ping (diagnostika sítě/SSL)
     try:
@@ -284,12 +301,14 @@ def main(mytimer: func.TimerRequest) -> None:
             logger.info("Reached safe runtime limit, will continue next run.")
             break
 
-        batch_window_ms = BINANCE_LIMIT * INTERVAL_MIN * 60 * 1000
+        # velikost okna v ms pro jeden request (limit * velikost svíčky)
+        interval_ms = INTERVAL_MIN * 60 * 1000
+        batch_window_ms = BINANCE_LIMIT * interval_ms
         end_ms = min(start_ms + batch_window_ms - 1, target_end_ms)
 
-        klines = fetch_klines(base_url, symbol, start_ms, end_ms, BINANCE_LIMIT)
+        klines = fetch_klines(base_url, symbol, interval_str, start_ms, end_ms, BINANCE_LIMIT)
         if not klines:
-            start_ms += INTERVAL_MIN * 60 * 1000
+            start_ms += interval_ms
             time.sleep(SLEEP_SEC)
             continue
 
@@ -306,7 +325,7 @@ def main(mytimer: func.TimerRequest) -> None:
             start_ms = klines[-1][6] + 1
             logger.info(f"Appended {added} rows; next start={from_ms(start_ms)}")
         else:
-            start_ms += INTERVAL_MIN * 60 * 1000
+            start_ms += interval_ms
 
         time.sleep(SLEEP_SEC)
 
