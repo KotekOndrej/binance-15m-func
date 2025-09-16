@@ -17,6 +17,10 @@ INTERVAL_MIN = 15
 SLEEP_SEC = 0.2
 MAX_RUNTIME_SEC = 8 * 60  # bezpečná mez (10 min je hard limit na Consumption)
 
+# Hlavičky (stará vs. nová s datetime)
+BASE_HEADER = "openTime,open,high,low,close,volume,closeTime,quoteVolume,numTrades,takerBuyBase,takerBuyQuote,ignore"
+NEW_HEADER = BASE_HEADER + ",closeTimeISO"
+
 logger = logging.getLogger("fetch_klines")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
@@ -33,6 +37,9 @@ def to_ms(dt: datetime) -> int:
 
 def from_ms(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+
+def iso_utc(ms: int) -> str:
+    return from_ms(ms).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def floor_to_interval(dt: datetime, minutes: int) -> datetime:
     m = (dt.minute // minutes) * minutes
@@ -79,7 +86,9 @@ def _blob_exists(blob: BlobClient) -> bool:
         return False
 
 def _create_block_blob_with_header(blob: BlobClient, header_line: str):
-    blob.upload_blob(header_line.encode("utf-8"), overwrite=True)
+    # vždy novou hlavičku s \n
+    line = header_line if header_line.endswith("\n") else header_line + "\n"
+    blob.upload_blob(line.encode("utf-8"), overwrite=True)
 
 def _ensure_block_blob(blob: BlobClient):
     """Pokud blob není BlockBlob (např. AppendBlob), přenahrát ho jako BlockBlob."""
@@ -93,38 +102,67 @@ def _ensure_block_blob(blob: BlobClient):
     except ResourceNotFoundError:
         pass
 
-def _ensure_header_present(blob: BlobClient, header_line: str):
+def _ensure_header_present_and_migrate(blob: BlobClient):
     """
-    Zajistí, že CSV začíná hlavičkou "openTime,open,...".
-    Ignoruje UTF-8 BOM, \r\n vs \n i úvodní whitespace.
-    Pokud chybí, blob přepíše na: header + '\n' (pokud chybí) + původní obsah.
+    Zajistí, že první řádek je NEW_HEADER.
+    - Pokud je prázdný → zapíše NEW_HEADER.
+    - Pokud je hlavička BASE_HEADER (stará) → provede MIGRACI: dopočítá closeTimeISO pro KAŽDÝ řádek.
+    - Pokud chybí hlavička → vloží NEW_HEADER před stávající obsah.
+    Ošetřuje UTF-8 BOM a whitespace na začátku.
     """
     try:
         props = blob.get_blob_properties()
         size = props.size or 0
-        expected = header_line.strip()
-
         if size == 0:
-            body = (header_line if header_line.endswith("\n") else header_line + "\n").encode("utf-8")
-            blob.upload_blob(body, overwrite=True)
-            logger.info("Blob empty -> wrote header.")
+            _create_block_blob_with_header(blob, NEW_HEADER)
+            logger.info("Blob empty -> wrote NEW_HEADER.")
             return
 
-        head_bytes = blob.download_blob(offset=0, length=4096).readall()
+        head_bytes = blob.download_blob(offset=0, length=8192).readall()
         head = head_bytes.decode("utf-8", errors="ignore")
         head_stripped = head.lstrip("\ufeff").lstrip()
         first_line = head_stripped.splitlines()[0] if head_stripped else ""
 
-        # už je tam správná hlavička
-        if first_line.replace("\r", "") == expected:
+        if first_line.replace("\r", "") == NEW_HEADER:
+            # už je nová hlavička
             return
 
-        # chybí → doplníme
+        if first_line.replace("\r", "") == BASE_HEADER:
+            # MIGRACE: dopočítej closeTimeISO pro všechny řádky
+            full = blob.download_blob().readall().decode("utf-8", errors="ignore")
+            lines = full.splitlines()
+            if not lines:
+                _create_block_blob_with_header(blob, NEW_HEADER)
+                logger.info("Blob had old header but no data -> wrote NEW_HEADER.")
+                return
+
+            out_lines = [NEW_HEADER]
+            for i, ln in enumerate(lines[1:], start=2):
+                if not ln.strip():
+                    continue
+                parts = ln.split(",")
+                try:
+                    # očekáváme min. 12 sloupců dle BASE_HEADER
+                    if len(parts) >= 12 and parts[6].isdigit():
+                        ct_ms = int(parts[6])
+                        parts.append(iso_utc(ct_ms))
+                        out_lines.append(",".join(parts))
+                    else:
+                        # nedokážeme spočítat -> necháme řádek jak je a přidáme prázdný sloupec
+                        out_lines.append(ln + ",")
+                except Exception:
+                    out_lines.append(ln + ",")
+            new_body = ("\n".join(out_lines) + "\n").encode("utf-8")
+            blob.upload_blob(new_body, overwrite=True)
+            logger.info(f"Migrated CSV from BASE_HEADER -> NEW_HEADER (rows={len(out_lines)-1}).")
+            return
+
+        # Neznámý první řádek → vlož NEW_HEADER na začátek
         full = blob.download_blob().readall()
-        prefix = (header_line if header_line.endswith("\n") else header_line + "\n").encode("utf-8")
+        prefix = (NEW_HEADER + "\n").encode("utf-8") if not NEW_HEADER.endswith("\n") else NEW_HEADER.encode("utf-8")
         new_body = prefix + full
         blob.upload_blob(new_body, overwrite=True)
-        logger.info(f"Header missing -> added header. Old first line (preview): {first_line[:60]!r}")
+        logger.info(f"Header missing/unknown -> prepended NEW_HEADER. Old first line preview: {first_line[:60]!r}")
     except ResourceNotFoundError:
         # neexistuje – řeší se jinde
         pass
@@ -167,7 +205,8 @@ def _append_block_blob(blob: BlobClient, payload_bytes: bytes):
 
 def kline_to_csv_line(k):
     # [openTime, open, high, low, close, volume, closeTime, quoteVolume, numTrades, takerBuyBase, takerBuyQuote, ignore]
-    return ",".join([str(k[i]) for i in range(12)]) + "\n"
+    # přidáme closeTimeISO (UTC)
+    return ",".join([str(k[i]) for i in range(12)] + [iso_utc(int(k[6]))]) + "\n"
 
 # ---- Hlavní funkce ----
 def main(mytimer: func.TimerRequest) -> None:
@@ -195,14 +234,13 @@ def main(mytimer: func.TimerRequest) -> None:
     _ensure_container(container)
     blob = container.get_blob_client(blob_name)
 
-    # Zajisti existenci CSV s hlavičkou
-    header = "openTime,open,high,low,close,volume,closeTime,quoteVolume,numTrades,takerBuyBase,takerBuyQuote,ignore\n"
+    # Zajisti existenci CSV s NOVOU hlavičkou
     if not _blob_exists(blob):
-        _create_block_blob_with_header(blob, header)
+        _create_block_blob_with_header(blob, NEW_HEADER)
 
-    # Ujisti se, že typ je BlockBlob + že hlavička je přítomná
+    # Ujisti se, že typ je BlockBlob + případně MIGRUJ NA NOVOU HLAVIČKU
     _ensure_block_blob(blob)
-    _ensure_header_present(blob, header)
+    _ensure_header_present_and_migrate(blob)
 
     # Zjisti start_ms z tailu CSV, jinak ze START_DATE_UTC
     start_ms = None
@@ -215,7 +253,8 @@ def main(mytimer: func.TimerRequest) -> None:
             lines = [ln for ln in chunk.splitlines() if ln.strip()]
             if lines:
                 parts = lines[-1].split(",")
-                if len(parts) >= 7 and parts[0].isdigit() and parts[6].isdigit():
+                # pozor: teď má řádek 13+ sloupců, ale closeTime je pořád index 6
+                if len(parts) >= 7 and parts[6].isdigit():
                     last_close_ms = int(parts[6])  # closeTime
                     start_ms = last_close_ms + 1
     except Exception as e:
