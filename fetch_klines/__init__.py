@@ -25,13 +25,7 @@ logger = logging.getLogger("fetch_klines")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-# ---- Pomocné funkce ----
-def get_env(name: str, default: str = None, required: bool = False) -> str:
-    val = os.getenv(name, default)
-    if required and (val is None or str(val).strip() == ""):
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return val
-
+# ---------- Pomocné časové ----------
 def to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
@@ -45,7 +39,14 @@ def floor_to_interval(dt: datetime, minutes: int) -> datetime:
     m = (dt.minute // minutes) * minutes
     return dt.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=m)
 
-# ---- Robustní HTTP volání na Binance s retry ----
+# ---------- Env ----------
+def get_env(name: str, default: str = None, required: bool = False) -> str:
+    val = os.getenv(name, default)
+    if required and (val is None or str(val).strip() == ""):
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return val
+
+# ---------- Binance HTTP s retry ----------
 def binance_get(url: str, params: dict, max_attempts: int = 6):
     backoff = 0.5
     last_err = None
@@ -71,7 +72,7 @@ def fetch_klines(base_url: str, symbol: str, start_ms: int, end_ms: int, limit: 
     params = {"symbol": symbol, "interval": "15m", "limit": limit, "startTime": start_ms, "endTime": end_ms}
     return binance_get(url, params)
 
-# ---- Block Blob „append“ (stage/commit) ----
+# ---------- Block Blob append (jen stage+commit, nikdy upload_blob) ----------
 def _ensure_container(container: ContainerClient):
     try:
         container.create_container()
@@ -85,37 +86,44 @@ def _blob_exists(blob: BlobClient) -> bool:
     except ResourceNotFoundError:
         return False
 
-def _create_block_blob_with_header(blob: BlobClient, header_line: str):
-    # vždy novou hlavičku s \n
-    line = header_line if header_line.endswith("\n") else header_line + "\n"
-    blob.upload_blob(line.encode("utf-8"), overwrite=True)
+def _put_full_body_as_single_block(blob: BlobClient, data_bytes: bytes):
+    """Nastaví obsah blobu přes block-list (1 blok). Bezpečné pro další append."""
+    from azure.storage.blob import BlobBlock
+    import base64, secrets
+    block_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+    blob.stage_block(block_id=block_id, data=data_bytes)
+    blob.commit_block_list([BlobBlock(block_id)])
 
-def _ensure_block_blob(blob: BlobClient):
-    """Pokud blob není BlockBlob (např. AppendBlob), přenahrát ho jako BlockBlob."""
+def _create_block_blob_with_header(blob: BlobClient, header_line: str):
+    # založ blob jako block-list (hlavička je 1. blok)
+    line = header_line if header_line.endswith("\n") else header_line + "\n"
+    _put_full_body_as_single_block(blob, line.encode("utf-8"))
+
+def _ensure_block_blob_type(blob: BlobClient):
+    """Pokud blob není BlockBlob (Append/Page), přenahrát ho jako BlockBlob (stage+commit)."""
     try:
         props = blob.get_blob_properties()
         blob_type = getattr(props, "blob_type", None)
         if str(blob_type).lower() != "blockblob":
             data = blob.download_blob().readall()
-            blob.upload_blob(data, overwrite=True)  # re-upload jako BlockBlob
-            logger.info(f"Blob type converted to BlockBlob (size={len(data)} bytes).")
+            _put_full_body_as_single_block(blob, data)
+            logger.info(f"Blob type converted to BlockBlob via block-list (size={len(data)}).")
     except ResourceNotFoundError:
         pass
 
 def _ensure_header_present_and_migrate(blob: BlobClient):
     """
     Zajistí, že první řádek je NEW_HEADER.
-    - Pokud je prázdný → zapíše NEW_HEADER.
-    - Pokud je hlavička BASE_HEADER (stará) → provede MIGRACI: dopočítá closeTimeISO pro KAŽDÝ řádek.
-    - Pokud chybí hlavička → vloží NEW_HEADER před stávající obsah.
-    Ošetřuje UTF-8 BOM a whitespace na začátku.
+    - prázdný → NEW_HEADER (stage+commit)
+    - BASE_HEADER → MIGRACE: dopočítá closeTimeISO, upload přes block-list
+    - chybí hlavička → prepended NEW_HEADER, upload přes block-list
     """
     try:
         props = blob.get_blob_properties()
         size = props.size or 0
         if size == 0:
             _create_block_blob_with_header(blob, NEW_HEADER)
-            logger.info("Blob empty -> wrote NEW_HEADER.")
+            logger.info("Blob empty -> wrote NEW_HEADER (block-list).")
             return
 
         head_bytes = blob.download_blob(offset=0, length=8192).readall()
@@ -124,47 +132,37 @@ def _ensure_header_present_and_migrate(blob: BlobClient):
         first_line = head_stripped.splitlines()[0] if head_stripped else ""
 
         if first_line.replace("\r", "") == NEW_HEADER:
-            # už je nová hlavička
             return
 
         if first_line.replace("\r", "") == BASE_HEADER:
-            # MIGRACE: dopočítej closeTimeISO pro všechny řádky
             full = blob.download_blob().readall().decode("utf-8", errors="ignore")
             lines = full.splitlines()
             if not lines:
                 _create_block_blob_with_header(blob, NEW_HEADER)
-                logger.info("Blob had old header but no data -> wrote NEW_HEADER.")
+                logger.info("Blob had old header but no data -> wrote NEW_HEADER (block-list).")
                 return
 
             out_lines = [NEW_HEADER]
-            for i, ln in enumerate(lines[1:], start=2):
+            for ln in lines[1:]:
                 if not ln.strip():
                     continue
                 parts = ln.split(",")
-                try:
-                    # očekáváme min. 12 sloupců dle BASE_HEADER
-                    if len(parts) >= 12 and parts[6].isdigit():
-                        ct_ms = int(parts[6])
-                        parts.append(iso_utc(ct_ms))
-                        out_lines.append(",".join(parts))
-                    else:
-                        # nedokážeme spočítat -> necháme řádek jak je a přidáme prázdný sloupec
-                        out_lines.append(ln + ",")
-                except Exception:
+                if len(parts) >= 12 and parts[6].isdigit():
+                    ct_ms = int(parts[6]); parts.append(iso_utc(ct_ms))
+                    out_lines.append(",".join(parts))
+                else:
                     out_lines.append(ln + ",")
             new_body = ("\n".join(out_lines) + "\n").encode("utf-8")
-            blob.upload_blob(new_body, overwrite=True)
-            logger.info(f"Migrated CSV from BASE_HEADER -> NEW_HEADER (rows={len(out_lines)-1}).")
+            _put_full_body_as_single_block(blob, new_body)
+            logger.info(f"Migrated CSV BASE_HEADER -> NEW_HEADER (rows={len(out_lines)-1}).")
             return
 
         # Neznámý první řádek → vlož NEW_HEADER na začátek
         full = blob.download_blob().readall()
         prefix = (NEW_HEADER + "\n").encode("utf-8") if not NEW_HEADER.endswith("\n") else NEW_HEADER.encode("utf-8")
-        new_body = prefix + full
-        blob.upload_blob(new_body, overwrite=True)
-        logger.info(f"Header missing/unknown -> prepended NEW_HEADER. Old first line preview: {first_line[:60]!r}")
+        _put_full_body_as_single_block(blob, prefix + full)
+        logger.info(f"Header missing/unknown -> prepended NEW_HEADER (block-list).")
     except ResourceNotFoundError:
-        # neexistuje – řeší se jinde
         pass
 
 def _extract_committed_ids(block_list_obj):
@@ -188,7 +186,7 @@ def _extract_committed_ids(block_list_obj):
     return ids
 
 def _append_block_blob(blob: BlobClient, payload_bytes: bytes):
-    """Přidá data na konec Block Blobu přes stage/commit; robustní napříč verzemi SDK."""
+    """Append přes stage/commit – zachová stávající block-list."""
     from azure.storage.blob import BlobBlock
     import base64, secrets
 
@@ -204,11 +202,10 @@ def _append_block_blob(blob: BlobClient, payload_bytes: bytes):
     blob.commit_block_list(new_list)
 
 def kline_to_csv_line(k):
-    # [openTime, open, high, low, close, volume, closeTime, quoteVolume, numTrades, takerBuyBase, takerBuyQuote, ignore]
-    # přidáme closeTimeISO (UTC)
+    # [openTime, open, high, low, close, volume, closeTime, quoteVolume, numTrades, takerBuyBase, takerBuyQuote, ignore] + closeTimeISO
     return ",".join([str(k[i]) for i in range(12)] + [iso_utc(int(k[6]))]) + "\n"
 
-# ---- Hlavní funkce ----
+# ---------- Hlavní ----------
 def main(mytimer: func.TimerRequest) -> None:
     start_exec = time.time()
 
@@ -234,15 +231,15 @@ def main(mytimer: func.TimerRequest) -> None:
     _ensure_container(container)
     blob = container.get_blob_client(blob_name)
 
-    # Zajisti existenci CSV s NOVOU hlavičkou
+    # Zajisti existenci CSV s NOVOU hlavičkou (přes block-list)
     if not _blob_exists(blob):
         _create_block_blob_with_header(blob, NEW_HEADER)
 
-    # Ujisti se, že typ je BlockBlob + případně MIGRUJ NA NOVOU HLAVIČKU
-    _ensure_block_blob(blob)
+    # Ujisti se, že typ je BlockBlob a že první obsah je přes block-list + migruj hlavičku
+    _ensure_block_blob_type(blob)
     _ensure_header_present_and_migrate(blob)
 
-    # Zjisti start_ms z tailu CSV, jinak ze START_DATE_UTC
+    # Najdi start_ms z tailu CSV, jinak START_DATE_UTC
     start_ms = None
     try:
         props = blob.get_blob_properties()
@@ -253,9 +250,9 @@ def main(mytimer: func.TimerRequest) -> None:
             lines = [ln for ln in chunk.splitlines() if ln.strip()]
             if lines:
                 parts = lines[-1].split(",")
-                # pozor: teď má řádek 13+ sloupců, ale closeTime je pořád index 6
+                # closeTime je pořád index 6
                 if len(parts) >= 7 and parts[6].isdigit():
-                    last_close_ms = int(parts[6])  # closeTime
+                    last_close_ms = int(parts[6])
                     start_ms = last_close_ms + 1
     except Exception as e:
         logger.warning(f"Tail parse failed: {e}")
