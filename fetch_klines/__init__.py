@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -11,12 +12,13 @@ from dateutil import parser as dateparser
 from azure.storage.blob import BlobServiceClient, ContainerClient, BlobClient
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 
-# ---- Konfigurace ----
+# ---- Konstanty / výchozí hodnoty ----
 BINANCE_LIMIT = 1000
 SLEEP_SEC = 0.2
-MAX_RUNTIME_SEC = 8 * 60  # bezpečná mez (10 min hard limit na Consumption)
+DEFAULT_GLOBAL_TIME_BUDGET_SEC = 500   # ~8m20s
+DEFAULT_SYMBOL_TIME_BUDGET_SEC = 120   # 2 min na symbol
 
-# Hlavičky (stará vs. nová s datetime)
+# Hlavičky
 BASE_HEADER = "openTime,open,high,low,close,volume,closeTime,quoteVolume,numTrades,takerBuyBase,takerBuyQuote,ignore"
 NEW_HEADER = BASE_HEADER + ",closeTimeISO"
 
@@ -39,7 +41,7 @@ def floor_to_interval(dt: datetime, minutes: int) -> datetime:
     return dt.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=m)
 
 def interval_to_minutes(interval_str: str) -> int:
-    """Podporuje 'Xm','Xh','Xd','Xw','XM' (měsíc ~30d pro účely okna/zarovnání)."""
+    """Podporuje 'Xm','Xh','Xd','Xw','XM' (M ~30d pro zarovnání)."""
     if not interval_str or len(interval_str) < 2:
         raise RuntimeError(f"Invalid BINANCE_INTERVAL: {interval_str!r}")
     unit = interval_str[-1]
@@ -63,17 +65,24 @@ def get_env(name: str, default: str = None, required: bool = False) -> str:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return val
 
+def get_env_int(name: str, default_int: int) -> int:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default_int
+    try:
+        return int(raw)
+    except ValueError:
+        return default_int
+
 def parse_symbols(env_val: str) -> list[str]:
     if not env_val:
         return []
     raw = env_val.replace(";", ",").split(",")
-    # split také whitespace
     out = []
     for piece in raw:
         for token in piece.strip().split():
             if token:
                 out.append(token.upper())
-    # unikáty v pořadí
     seen = set(); res = []
     for s in out:
         if s not in seen:
@@ -121,7 +130,6 @@ def _blob_exists(blob: BlobClient) -> bool:
         return False
 
 def _put_full_body_as_single_block(blob: BlobClient, data_bytes: bytes):
-    """Nastaví obsah blobu přes block-list (1 blok). Bezpečné pro další append."""
     from azure.storage.blob import BlobBlock
     import base64, secrets
     block_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
@@ -133,7 +141,6 @@ def _create_block_blob_with_header(blob: BlobClient, header_line: str):
     _put_full_body_as_single_block(blob, line.encode("utf-8"))
 
 def _ensure_block_blob_type(blob: BlobClient):
-    """Pokud blob není BlockBlob (Append/Page), přenahrát ho jako BlockBlob (stage+commit)."""
     try:
         props = blob.get_blob_properties()
         blob_type = getattr(props, "blob_type", None)
@@ -145,12 +152,6 @@ def _ensure_block_blob_type(blob: BlobClient):
         pass
 
 def _ensure_header_present_and_migrate(blob: BlobClient):
-    """
-    Zajistí, že první řádek je NEW_HEADER.
-    - prázdný → NEW_HEADER (stage+commit)
-    - BASE_HEADER → MIGRACE: dopočítá closeTimeISO, upload přes block-list
-    - chybí hlavička → prepended NEW_HEADER, upload přes block-list
-    """
     try:
         props = blob.get_blob_properties()
         size = props.size or 0
@@ -190,16 +191,14 @@ def _ensure_header_present_and_migrate(blob: BlobClient):
             logger.info(f"{blob.blob_name}: Migrated BASE_HEADER -> NEW_HEADER (rows={len(out_lines)-1}).")
             return
 
-        # Neznámý první řádek → vlož NEW_HEADER na začátek
         full = blob.download_blob().readall()
         prefix = (NEW_HEADER + "\n").encode("utf-8") if not NEW_HEADER.endswith("\n") else NEW_HEADER.encode("utf-8")
         _put_full_body_as_single_block(blob, prefix + full)
-        logger.info(f"{blob.blob_name}: Header missing/unknown -> prepended NEW_HEADER.")
+        logger.info(f"{blob.blob_name}: Header missing/unknown -> prepended NEW_HEADER (block-list).")
     except ResourceNotFoundError:
         pass
 
 def _extract_committed_ids(block_list_obj):
-    """Vrátí list ID (base64) committed bloků z různých tvarů návratu get_block_list."""
     committed = []
     if hasattr(block_list_obj, "committed_blocks"):
         committed = block_list_obj.committed_blocks or []
@@ -210,7 +209,6 @@ def _extract_committed_ids(block_list_obj):
             committed = block_list_obj
     else:
         committed = []
-
     ids = []
     for b in committed:
         bid = getattr(b, "id", None) or getattr(b, "name", None)
@@ -219,26 +217,39 @@ def _extract_committed_ids(block_list_obj):
     return ids
 
 def _append_block_blob(blob: BlobClient, payload_bytes: bytes):
-    """Append přes stage/commit – zachová stávající block-list."""
     from azure.storage.blob import BlobBlock
     import base64, secrets
-
     bl = blob.get_block_list(block_list_type="committed")
     committed_ids = _extract_committed_ids(bl)
-
     new_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
     logger.info(f"{blob.blob_name}: staging block id={new_id} size={len(payload_bytes)}")
     blob.stage_block(block_id=new_id, data=payload_bytes)
-
     new_list = [BlobBlock(i) for i in committed_ids] + [BlobBlock(new_id)]
     logger.info(f"{blob.blob_name}: committing block list: prev={len(committed_ids)} +1")
     blob.commit_block_list(new_list)
 
 def kline_to_csv_line(k):
-    # [openTime, open, high, low, close, volume, closeTime, quoteVolume, numTrades, takerBuyBase, takerBuyQuote, ignore] + closeTimeISO
     return ",".join([str(k[i]) for i in range(12)] + [iso_utc(int(k[6]))]) + "\n"
 
-# ---------- Zpracování JEDNOHO symbolu ----------
+# ---------- Stavový blob (rotace start indexu) ----------
+def _get_state_blob(container: ContainerClient, state_blob_name: str) -> BlobClient:
+    return container.get_blob_client(state_blob_name)
+
+def _read_state(state_blob: BlobClient) -> dict:
+    try:
+        data = state_blob.download_blob().readall()
+        return json.loads(data.decode("utf-8"))
+    except ResourceNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning(f"State read failed, starting fresh: {e}")
+        return {}
+
+def _write_state(state_blob: BlobClient, state: dict):
+    data = json.dumps(state, separators=(",", ":")).encode("utf-8")
+    _put_full_body_as_single_block(state_blob, data)
+
+# ---------- Zpracování JEDNOHO symbolu s časovým budgetem ----------
 def process_symbol(symbol: str,
                    interval_str: str,
                    container: ContainerClient,
@@ -246,28 +257,21 @@ def process_symbol(symbol: str,
                    blob_name_tmpl: str,
                    start_date_str: str,
                    base_url: str,
-                   conn_str: str,
                    INTERVAL_MIN: int,
-                   target_end_ms: int) -> int:
-    """Stáhne a appendne data pro konkrétní symbol. Vrací počet přidaných řádků."""
-    # Sestav název blobu
-    blob_file = blob_name_tmpl.replace("{SYMBOL}", symbol).replace("{INTERVAL}", interval_str)
-    if blob_dir:
-        # hezky normalizovat lomítka
-        blob_dir_norm = blob_dir.strip("/ ")
-        blob_path = f"{blob_dir_norm}/{blob_file}"
-    else:
-        blob_path = blob_file
+                   target_end_ms: int,
+                   time_budget_sec: int) -> int:
+    start_exec = time.time()
+    interval_ms = INTERVAL_MIN * 60 * 1000
 
+    blob_file = blob_name_tmpl.replace("{SYMBOL}", symbol).replace("{INTERVAL}", interval_str)
+    blob_path = f"{blob_dir.strip('/ ')}/{blob_file}" if blob_dir.strip() else blob_file
     blob: BlobClient = container.get_blob_client(blob_path)
 
-    # Veď CSV s novou hlavičkou a správným typem
     if not _blob_exists(blob):
         _create_block_blob_with_header(blob, NEW_HEADER)
     _ensure_block_blob_type(blob)
     _ensure_header_present_and_migrate(blob)
 
-    # Najdi start_ms z tailu CSV, jinak START_DATE_UTC
     start_ms = None
     try:
         props = blob.get_blob_properties()
@@ -278,7 +282,6 @@ def process_symbol(symbol: str,
             lines = [ln for ln in chunk.splitlines() if ln.strip()]
             if lines:
                 parts = lines[-1].split(",")
-                # closeTime je pořád index 6
                 if len(parts) >= 7 and parts[6].isdigit():
                     last_close_ms = int(parts[6])
                     start_ms = last_close_ms + 1
@@ -293,24 +296,18 @@ def process_symbol(symbol: str,
         logger.info(f"{symbol}: Up to date – nothing to fetch.")
         return 0
 
-    logger.info(f"{symbol}: downloading {interval_str} klines from {from_ms(start_ms)} to {from_ms(target_end_ms)}")
-
-    # Pre-flight ping (diagnostika sítě/SSL) – jednou stačí, ale necháme i per-symbol lehký check
+    logger.info(f"{symbol}: start={from_ms(start_ms)} end={from_ms(target_end_ms)} interval={interval_str} budget={time_budget_sec}s")
     try:
-        ping = requests.get(f"{base_url}/api/v3/ping", timeout=15)
+        ping = requests.get(f"{base_url}/api/v3/ping", timeout=10)
         if ping.status_code != 200:
             raise RuntimeError(f"Ping failed {ping.status_code}: {ping.text}")
     except RequestException as e:
         raise RuntimeError(f"{symbol}: Binance ping failed: {e}") from e
 
-    # Stahování a append
     fetched_total = 0
-    interval_ms = INTERVAL_MIN * 60 * 1000
-    start_exec = time.time()
-
     while start_ms <= target_end_ms:
-        if time.time() - start_exec > MAX_RUNTIME_SEC:
-            logger.info(f"{symbol}: Reached safe runtime limit, will continue next run.")
+        if time.time() - start_exec > time_budget_sec:
+            logger.info(f"{symbol}: time budget reached, stopping symbol loop.")
             break
 
         batch_window_ms = BINANCE_LIMIT * interval_ms
@@ -333,50 +330,73 @@ def process_symbol(symbol: str,
             added = len(rows)
             fetched_total += added
             start_ms = klines[-1][6] + 1
-            logger.info(f"{symbol}: appended {added} rows; next start={from_ms(start_ms)}")
+            logger.info(f"{symbol}: appended {added} rows; next={from_ms(start_ms)}")
         else:
             start_ms += interval_ms
 
-        time.sleep(SLEEP_SEC)  # šetříme limity
+        time.sleep(SLEEP_SEC)
 
     logger.info(f"{symbol}: TOTAL appended {fetched_total} rows -> {blob.blob_name}")
     return fetched_total
 
 # ---------- Hlavní ----------
 def main(mytimer: func.TimerRequest) -> None:
-    # Env – MULTI SYMBOLS
+    run_start = time.time()
+
     symbols_env = get_env("BINANCE_SYMBOLS", "")
     symbols = parse_symbols(symbols_env)
     if not symbols:
-        # zpětná kompatibilita: BINANCE_SYMBOL (single)
         single = get_env("BINANCE_SYMBOL", "")
         if single:
             symbols = [single.upper()]
         else:
             raise RuntimeError("Set BINANCE_SYMBOLS (e.g. 'BTCUSDT, ETHUSDT') or BINANCE_SYMBOL.")
+    n_symbols = len(symbols)
 
     interval_str = get_env("BINANCE_INTERVAL", "15m")
     INTERVAL_MIN = interval_to_minutes(interval_str)
 
+    global_budget = get_env_int("GLOBAL_TIME_BUDGET_SEC", DEFAULT_GLOBAL_TIME_BUDGET_SEC)
+    symbol_budget = get_env_int("SYMBOL_TIME_BUDGET_SEC", DEFAULT_SYMBOL_TIME_BUDGET_SEC)
+
     container_name = get_env("BLOB_CONTAINER", required=True)
     blob_name_tmpl = get_env("BLOB_NAME_TEMPLATE", "{SYMBOL}_{INTERVAL}.csv")
-    blob_dir = get_env("BLOB_DIR", "")  # volitelně např. "market-data"
+    blob_dir = get_env("BLOB_DIR", "")
     start_date_str = get_env("START_DATE_UTC", "2020-01-01T00:00:00Z")
     base_url = get_env("BINANCE_BASE_URL", "https://api.binance.com")
     conn_str = get_env("AzureWebJobsStorage", required=True)
 
-    # Časové okno: poslední kompletně uzavřená svíčka pro daný interval
+    # State blob (pro rotaci)
+    state_blob_name = get_env("STATE_BLOB_NAME", f"_state/scheduler_{interval_str}.json")
+
     now_utc = datetime.now(timezone.utc)
     last_closed = floor_to_interval(now_utc, INTERVAL_MIN) - timedelta(minutes=INTERVAL_MIN)
     target_end_ms = to_ms(last_closed) + (INTERVAL_MIN * 60 * 1000) - 1
 
-    # Blob klienti
     blob_service = BlobServiceClient.from_connection_string(conn_str)
     container = blob_service.get_container_client(container_name)
     _ensure_container(container)
 
+    # Načti stav
+    state_blob = _get_state_blob(container, state_blob_name)
+    state = _read_state(state_blob)
+    start_idx = int(state.get("next_start_index", 0)) % n_symbols
+
+    logger.info(f"Symbols={symbols} | start_index={start_idx} | global_budget={global_budget}s | per_symbol_budget={symbol_budget}s")
+
     total_rows = 0
-    for idx, symbol in enumerate(symbols, start=1):
+    processed = 0
+    i = start_idx
+    while processed < n_symbols:
+        elapsed_global = time.time() - run_start
+        remaining_global = max(0, global_budget - elapsed_global)
+        if remaining_global < 5:
+            logger.info("Global time budget nearly exhausted, stopping run.")
+            break
+
+        symbol = symbols[i]
+        per_symbol_budget = int(min(symbol_budget, max(5, remaining_global - 5)))
+
         try:
             added = process_symbol(
                 symbol=symbol,
@@ -386,15 +406,25 @@ def main(mytimer: func.TimerRequest) -> None:
                 blob_name_tmpl=blob_name_tmpl,
                 start_date_str=start_date_str,
                 base_url=base_url,
-                conn_str=conn_str,
                 INTERVAL_MIN=INTERVAL_MIN,
                 target_end_ms=target_end_ms,
+                time_budget_sec=per_symbol_budget,
             )
             total_rows += added
         except Exception as e:
             logger.error(f"{symbol}: FAILED -> {e}")
 
-        # malé zpoždění mezi symboly kvůli limitům
+        processed += 1
+        i = (i + 1) % n_symbols
         time.sleep(0.2)
 
-    logger.info(f"ALL DONE: symbols={len(symbols)}, total_rows_appended={total_rows}")
+    # Ulož nový start index pro příští běh
+    new_start_idx = i % n_symbols
+    state_out = {
+        "next_start_index": new_start_idx,
+        "last_run_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "symbols": symbols,
+        "interval": interval_str,
+    }
+    _write_state(state_blob, state_out)
+    logger.info(f"RUN DONE: processed={processed}/{n_symbols}, total_rows_appended={total_rows}, next_start_index={new_start_idx}")
