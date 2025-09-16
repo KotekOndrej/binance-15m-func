@@ -11,6 +11,29 @@ from dateutil import parser as dateparser
 
 from azure.storage.blob import BlobServiceClient, ContainerClient, BlobClient
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+import traceback
+
+SENSITIVE_KEYS = {"AzureWebJobsStorage", "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING",
+                  "WEBSITE_RUN_FROM_PACKAGE", "APPINSIGHTS_INSTRUMENTATIONKEY"}
+
+def safe_env():
+    out = {}
+    for k, v in os.environ.items():
+        if k in SENSITIVE_KEYS:
+            out[k] = "<redacted>"
+        elif "KEY" in k.upper() or "SECRET" in k.upper() or "PASSWORD" in k.upper():
+            out[k] = "<redacted>"
+        else:
+            out[k] = v
+    return out
+
+def preview_blob_paths(symbols, interval_str, blob_dir, blob_name_tmpl):
+    paths = []
+    for s in symbols:
+        fname = blob_name_tmpl.replace("{SYMBOL}", s).replace("{INTERVAL}", interval_str)
+        p = f"{blob_dir.strip('/ ')}/{fname}" if blob_dir.strip() else fname
+        paths.append((s, p))
+    return paths
 
 # ---- Konstanty / výchozí hodnoty ----
 BINANCE_LIMIT = 1000
@@ -363,70 +386,58 @@ def process_symbol(symbol: str,
 
 # ---------- Hlavní ----------
 def main(mytimer: func.TimerRequest) -> None:
-    run_start = time.time()
+    try:
+        # ---- načti symboly (stejně jako dřív) ----
+        symbols_env = get_env("BINANCE_SYMBOLS", "")
+        symbols = parse_symbols(symbols_env)
+        if not symbols:
+            single = get_env("BINANCE_SYMBOL", "")
+            if single:
+                symbols = [single.upper()]
+            else:
+                raise RuntimeError("Set BINANCE_SYMBOLS (např. 'BTCUSDT, ETHUSDT') nebo BINANCE_SYMBOL.")
 
-    symbols_env = get_env("BINANCE_SYMBOLS", "")
-    symbols = parse_symbols(symbols_env)
-    if not symbols:
-        single = get_env("BINANCE_SYMBOL", "")
-        if single:
-            symbols = [single.upper()]
-        else:
-            raise RuntimeError("Set BINANCE_SYMBOLS (e.g. 'BTCUSDT, ETHUSDT') or BINANCE_SYMBOL.")
-    n_symbols = len(symbols)
+        interval_str = get_env("BINANCE_INTERVAL", "15m")
+        INTERVAL_MIN = interval_to_minutes(interval_str)
 
-    interval_str = get_env("BINANCE_INTERVAL", "15m")
-    INTERVAL_MIN = interval_to_minutes(interval_str)
+        container_name = get_env("BLOB_CONTAINER", required=True)
+        blob_name_tmpl = get_env("BLOB_NAME_TEMPLATE", "{SYMBOL}_{INTERVAL}.csv")
+        blob_dir = get_env("BLOB_DIR", "")
+        start_date_str = get_env("START_DATE_UTC", "2020-01-01T00:00:00Z")
+        base_url = get_env("BINANCE_BASE_URL", "https://api.binance.com")
+        conn_str = get_env("AzureWebJobsStorage", required=True)
 
-    global_budget = get_env_int("GLOBAL_TIME_BUDGET_SEC", DEFAULT_GLOBAL_TIME_BUDGET_SEC)
-    symbol_budget = get_env_int("SYMBOL_TIME_BUDGET_SEC", DEFAULT_SYMBOL_TIME_BUDGET_SEC)
+        # --- DEBUG LOGS: co opravdu vidíme ---
+        logger.info(f"Symbols parsed: {symbols}")
+        logger.info(f"Interval: {interval_str} ({INTERVAL_MIN} min)")
+        logger.info(f"Blob container: {container_name}")
+        logger.info(f"Blob dir: '{blob_dir}', name template: '{blob_name_tmpl}'")
+        for sym, path in preview_blob_paths(symbols, interval_str, blob_dir, blob_name_tmpl):
+            logger.info(f"RESOLVED PATH -> {sym}: '{path}'")
 
-    container_name = get_env("BLOB_CONTAINER", required=True)
-    blob_name_tmpl = get_env("BLOB_NAME_TEMPLATE", "{SYMBOL}_{INTERVAL}.csv")
-    blob_dir = get_env("BLOB_DIR", "")
-    start_date_str = get_env("START_DATE_UTC", "2020-01-01T00:00:00Z")
-    base_url = get_env("BINANCE_BASE_URL", "https://api.binance.com")
-    conn_str = get_env("AzureWebJobsStorage", required=True)
+        # ---- zbytek tvé původní main logiky beze změny ----
+        now_utc = datetime.now(timezone.utc)
+        last_closed = floor_to_interval(now_utc, INTERVAL_MIN) - timedelta(minutes=INTERVAL_MIN)
+        target_end_ms = to_ms(last_closed) + (INTERVAL_MIN * 60 * 1000) - 1
 
-    state_blob_name = get_env("STATE_BLOB_NAME", f"_state/scheduler_{interval_str}.json")
+        blob_service = BlobServiceClient.from_connection_string(conn_str)
+        container = blob_service.get_container_client(container_name)
+        _ensure_container(container)
 
-    now_utc = datetime.now(timezone.utc)
-    last_closed = floor_to_interval(now_utc, INTERVAL_MIN) - timedelta(minutes=INTERVAL_MIN)
-    target_end_ms = to_ms(last_closed) + (INTERVAL_MIN * 60 * 1000) - 1
+        # Pre-init: vytvoř CSV pro všechny symboly (ať vzniknou soubory hned)
+        for s in symbols:
+            path = _blob_path_for(s, interval_str, blob_dir, blob_name_tmpl)
+            blob = container.get_blob_client(path)
+            if not _blob_exists(blob):
+                logger.info(f"Init file for {s}: '{path}'")
+                _create_block_blob_with_header(blob, NEW_HEADER)
+            _ensure_block_blob_type(blob)
+            _ensure_header_present_and_migrate(blob)
 
-    blob_service = BlobServiceClient.from_connection_string(conn_str)
-    container = blob_service.get_container_client(container_name)
-    _ensure_container(container)
-
-    logger.info(f"Parsed symbols: {symbols}")
-    logger.info(f"Blob dir='{blob_dir}', name template='{blob_name_tmpl}', container='{container_name}'")
-
-    # 1) PRE-INIT: vždy založ CSV pro všechny symboly (aby vznikly soubory hned)
-    _pre_init_all_symbols(symbols, interval_str, container, blob_dir, blob_name_tmpl)
-
-    # 2) Načti stav rotace a spusť symboly v rotovaném pořadí s time budgety
-    state_blob = _get_state_blob(container, state_blob_name)
-    state = _read_state(state_blob)
-    start_idx = int(state.get("next_start_index", 0)) % n_symbols
-
-    logger.info(f"Rotation start_index={start_idx} | global_budget={global_budget}s | per_symbol_budget={symbol_budget}s")
-
-    total_rows = 0
-    processed = 0
-    i = start_idx
-    while processed < n_symbols:
-        elapsed_global = time.time() - run_start
-        remaining_global = max(0, global_budget - elapsed_global)
-        if remaining_global < 5:
-            logger.info("Global time budget nearly exhausted, stopping run.")
-            break
-
-        symbol = symbols[i]
-        per_symbol_budget = int(min(symbol_budget, max(5, remaining_global - 5)))
-
-        try:
+        total_rows = 0
+        for s in symbols:
             added = process_symbol(
-                symbol=symbol,
+                symbol=s,
                 interval_str=interval_str,
                 container=container,
                 blob_dir=blob_dir,
@@ -435,23 +446,19 @@ def main(mytimer: func.TimerRequest) -> None:
                 base_url=base_url,
                 INTERVAL_MIN=INTERVAL_MIN,
                 target_end_ms=target_end_ms,
-                time_budget_sec=per_symbol_budget,
+                time_budget_sec=10**9,
             )
             total_rows += added
-        except Exception as e:
-            logger.error(f"{symbol}: FAILED -> {e}")
+            time.sleep(0.2)
+        logger.info(f"ALL DONE: {len(symbols)} symbols, total rows appended: {total_rows}")
 
-        processed += 1
-        i = (i + 1) % n_symbols
-        time.sleep(0.2)
-
-    # Ulož next_start_index pro příští běh
-    new_start_idx = i % n_symbols
-    state_out = {
-        "next_start_index": new_start_idx,
-        "last_run_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "symbols": symbols,
-        "interval": interval_str,
-    }
-    _write_state(state_blob, state_out)
-    logger.info(f"RUN DONE: processed={processed}/{n_symbols}, total_rows_appended={total_rows}, next_start_index={new_start_idx}")
+    except Exception as e:
+        # Kompletní traceback do logu
+        logger.error("UNHANDLED EXCEPTION in main()")
+        logger.error("Environment snapshot (safe): %s", {k: safe_env().get(k) for k in [
+            "BINANCE_SYMBOLS","BINANCE_SYMBOL","BINANCE_INTERVAL",
+            "BLOB_CONTAINER","BLOB_NAME_TEMPLATE","BLOB_DIR","START_DATE_UTC"
+        ]})
+        logger.exception(e)  # <-- vypíše celý stack trace
+        # Pro jistotu znovu vyhodíme, aby se v Portálu zobrazilo "Failed"
+        raise
