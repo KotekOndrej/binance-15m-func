@@ -249,6 +249,27 @@ def _write_state(state_blob: BlobClient, state: dict):
     data = json.dumps(state, separators=(",", ":")).encode("utf-8")
     _put_full_body_as_single_block(state_blob, data)
 
+# ---------- Pomocné: výpočet názvu blobu pro symbol ----------
+def _blob_path_for(symbol: str, interval_str: str, blob_dir: str, blob_name_tmpl: str) -> str:
+    blob_file = blob_name_tmpl.replace("{SYMBOL}", symbol).replace("{INTERVAL}", interval_str)
+    return f"{blob_dir.strip('/ ')}/{blob_file}" if blob_dir.strip() else blob_file
+
+# ---------- Pre-init: vytvoř CSV s hlavičkou pro VŠECHNY symboly ----------
+def _pre_init_all_symbols(symbols, interval_str, container: ContainerClient, blob_dir, blob_name_tmpl):
+    created = 0
+    for s in symbols:
+        path = _blob_path_for(s, interval_str, blob_dir, blob_name_tmpl)
+        blob = container.get_blob_client(path)
+        if not _blob_exists(blob):
+            logger.info(f"Pre-init: creating CSV for {s} at '{path}'")
+            _create_block_blob_with_header(blob, NEW_HEADER)
+        else:
+            logger.info(f"Pre-init: CSV already exists for {s} at '{path}'")
+        _ensure_block_blob_type(blob)
+        _ensure_header_present_and_migrate(blob)
+        created += 1
+    logger.info(f"Pre-init done for {created} symbols.")
+
 # ---------- Zpracování JEDNOHO symbolu s časovým budgetem ----------
 def process_symbol(symbol: str,
                    interval_str: str,
@@ -263,15 +284,16 @@ def process_symbol(symbol: str,
     start_exec = time.time()
     interval_ms = INTERVAL_MIN * 60 * 1000
 
-    blob_file = blob_name_tmpl.replace("{SYMBOL}", symbol).replace("{INTERVAL}", interval_str)
-    blob_path = f"{blob_dir.strip('/ ')}/{blob_file}" if blob_dir.strip() else blob_file
+    blob_path = _blob_path_for(symbol, interval_str, blob_dir, blob_name_tmpl)
     blob: BlobClient = container.get_blob_client(blob_path)
 
+    # (pre-init už to udělal) – pro jistotu necháme idempotentní kontroly
     if not _blob_exists(blob):
         _create_block_blob_with_header(blob, NEW_HEADER)
     _ensure_block_blob_type(blob)
     _ensure_header_present_and_migrate(blob)
 
+    # Najdi start_ms
     start_ms = None
     try:
         props = blob.get_blob_properties()
@@ -293,10 +315,10 @@ def process_symbol(symbol: str,
         start_ms = to_ms(start_dt)
 
     if start_ms > target_end_ms:
-        logger.info(f"{symbol}: Up to date – nothing to fetch.")
+        logger.info(f"{symbol}: Up to date – nothing to fetch. (blob={blob.blob_name})")
         return 0
 
-    logger.info(f"{symbol}: start={from_ms(start_ms)} end={from_ms(target_end_ms)} interval={interval_str} budget={time_budget_sec}s")
+    logger.info(f"{symbol}: start={from_ms(start_ms)} end={from_ms(target_end_ms)} interval={interval_str} budget={time_budget_sec}s -> blob={blob.blob_name}")
     try:
         ping = requests.get(f"{base_url}/api/v3/ping", timeout=10)
         if ping.status_code != 200:
@@ -366,7 +388,6 @@ def main(mytimer: func.TimerRequest) -> None:
     base_url = get_env("BINANCE_BASE_URL", "https://api.binance.com")
     conn_str = get_env("AzureWebJobsStorage", required=True)
 
-    # State blob (pro rotaci)
     state_blob_name = get_env("STATE_BLOB_NAME", f"_state/scheduler_{interval_str}.json")
 
     now_utc = datetime.now(timezone.utc)
@@ -377,12 +398,18 @@ def main(mytimer: func.TimerRequest) -> None:
     container = blob_service.get_container_client(container_name)
     _ensure_container(container)
 
-    # Načti stav
+    logger.info(f"Parsed symbols: {symbols}")
+    logger.info(f"Blob dir='{blob_dir}', name template='{blob_name_tmpl}', container='{container_name}'")
+
+    # 1) PRE-INIT: vždy založ CSV pro všechny symboly (aby vznikly soubory hned)
+    _pre_init_all_symbols(symbols, interval_str, container, blob_dir, blob_name_tmpl)
+
+    # 2) Načti stav rotace a spusť symboly v rotovaném pořadí s time budgety
     state_blob = _get_state_blob(container, state_blob_name)
     state = _read_state(state_blob)
     start_idx = int(state.get("next_start_index", 0)) % n_symbols
 
-    logger.info(f"Symbols={symbols} | start_index={start_idx} | global_budget={global_budget}s | per_symbol_budget={symbol_budget}s")
+    logger.info(f"Rotation start_index={start_idx} | global_budget={global_budget}s | per_symbol_budget={symbol_budget}s")
 
     total_rows = 0
     processed = 0
@@ -418,7 +445,7 @@ def main(mytimer: func.TimerRequest) -> None:
         i = (i + 1) % n_symbols
         time.sleep(0.2)
 
-    # Ulož nový start index pro příští běh
+    # Ulož next_start_index pro příští běh
     new_start_idx = i % n_symbols
     state_out = {
         "next_start_index": new_start_idx,
