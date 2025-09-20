@@ -11,7 +11,6 @@ from dateutil import parser as dateparser
 
 from azure.storage.blob import BlobServiceClient, ContainerClient, BlobClient
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
-import traceback
 
 SENSITIVE_KEYS = {"AzureWebJobsStorage", "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING",
                   "WEBSITE_RUN_FROM_PACKAGE", "APPINSIGHTS_INSTRUMENTATIONKEY"}
@@ -138,7 +137,7 @@ def fetch_klines(base_url: str, symbol: str, interval_str: str, start_ms: int, e
     params = {"symbol": symbol, "interval": interval_str, "limit": limit, "startTime": start_ms, "endTime": end_ms}
     return binance_get(url, params)
 
-# ---------- NOVÉ: ověření existence symbolu ----------
+# ---------- Ověření existence symbolu ----------
 def symbol_exists(base_url: str, symbol: str) -> bool:
     """
     True, pokud symbol existuje na Binance Spot a je v statusu TRADING.
@@ -148,7 +147,6 @@ def symbol_exists(base_url: str, symbol: str) -> bool:
     try:
         r = requests.get(url, params={"symbol": symbol}, timeout=15)
         if r.status_code == 400:
-            # neexistující ticker => přeskočit
             return False
         r.raise_for_status()
         data = r.json()
@@ -159,7 +157,6 @@ def symbol_exists(base_url: str, symbol: str) -> bool:
         return (s0.get("symbol") == symbol) and (s0.get("status") == "TRADING")
     except RequestException as e:
         logger.warning(f"symbol_exists: RequestException for {symbol}: {e}")
-        # být konzervativní – když si nejsme jistí, raději symbol vynecháme
         return False
     except Exception as e:
         logger.warning(f"symbol_exists: Unexpected error for {symbol}: {e}")
@@ -180,11 +177,11 @@ def _blob_exists(blob: BlobClient) -> bool:
         return False
 
 def _put_full_body_as_single_block(blob: BlobClient, data_bytes: bytes):
-    from azure.storage.blob import BlobBlock
     import base64, secrets
     block_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
     blob.stage_block(block_id=block_id, data=data_bytes)
-    blob.commit_block_list([BlobBlock(block_id)])
+    # Pozn.: commit pouze s list[str] (base64 IDs)
+    blob.commit_block_list([block_id])
 
 def _create_block_blob_with_header(blob: BlobClient, header_line: str):
     line = header_line if header_line.endswith("\n") else header_line + "\n"
@@ -248,56 +245,31 @@ def _ensure_header_present_and_migrate(blob: BlobClient):
     except ResourceNotFoundError:
         pass
 
-def _extract_committed_ids(block_list_obj):
-    committed = []
-    if hasattr(block_list_obj, "committed_blocks"):
-        committed = block_list_obj.committed_blocks or []
-    elif isinstance(block_list_obj, (list, tuple)):
-        if isinstance(block_list_obj, tuple) and len(block_list_obj) > 0:
-            committed = block_list_obj[0] or []
-        else:
-            committed = block_list_obj
-    else:
-        committed = []
-    ids = []
-    for b in committed:
-        bid = getattr(b, "id", None) or getattr(b, "name", None)
-        if bid:
-            ids.append(bid)
-    return ids
-
 def _append_block_blob(blob: BlobClient, payload_bytes: bytes):
-    from azure.storage.blob import BlobBlock
     import base64, secrets
+
+    # 1) načti committed block IDs jako čisté stringy
     bl = blob.get_block_list(block_list_type="committed")
-    committed_ids = _extract_committed_ids(bl)
+    committed_ids: list[str] = []
+    if bl:
+        blocks = getattr(bl, "committed_blocks", None) or []
+        for b in blocks:
+            bid = getattr(b, "id", None) or getattr(b, "name", None)
+            if isinstance(bid, bytes):
+                bid = bid.decode("ascii")
+            if isinstance(bid, str) and bid.strip():
+                committed_ids.append(bid)
+
+    # 2) stage nového bloku
     new_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-    logger.info(f"{blob.blob_name}: staging block id={new_id} size={len(payload_bytes)}")
     blob.stage_block(block_id=new_id, data=payload_bytes)
-    new_list = [BlobBlock(i) for i in committed_ids] + [BlobBlock(new_id)]
-    logger.info(f"{blob.blob_name}: committing block list: prev={len(committed_ids)} +1")
-    blob.commit_block_list(new_list)
+
+    # 3) commit – pošli list[str] včetně všech předchozích + nový
+    new_list_ids = committed_ids + [new_id]
+    blob.commit_block_list(new_list_ids)
 
 def kline_to_csv_line(k):
     return ",".join([str(k[i]) for i in range(12)] + [iso_utc(int(k[6]))]) + "\n"
-
-# ---------- Stavový blob (rotace start indexu) ----------
-def _get_state_blob(container: ContainerClient, state_blob_name: str) -> BlobClient:
-    return container.get_blob_client(state_blob_name)
-
-def _read_state(state_blob: BlobClient) -> dict:
-    try:
-        data = state_blob.download_blob().readall()
-        return json.loads(data.decode("utf-8"))
-    except ResourceNotFoundError:
-        return {}
-    except Exception as e:
-        logger.warning(f"State read failed, starting fresh: {e}")
-        return {}
-
-def _write_state(state_blob: BlobClient, state: dict):
-    data = json.dumps(state, separators=(",", ":")).encode("utf-8")
-    _put_full_body_as_single_block(state_blob, data)
 
 # ---------- Pomocné: výpočet názvu blobu pro symbol ----------
 def _blob_path_for(symbol: str, interval_str: str, blob_dir: str, blob_name_tmpl: str) -> str:
@@ -419,11 +391,15 @@ def main(mytimer: func.TimerRequest) -> None:
         container_name = get_env("BLOB_CONTAINER", required=True)
         blob_name_tmpl = get_env("BLOB_NAME_TEMPLATE", "{SYMBOL}_{INTERVAL}.csv")
         blob_dir = get_env("BLOB_DIR", "")
+        # normalizace BLOB_DIR
+        if not blob_dir or str(blob_dir).strip().lower() in ("", "none", "/"):
+            blob_dir = ""
+
         start_date_str = get_env("START_DATE_UTC", "2020-01-01T00:00:00Z")
         base_url = get_env("BINANCE_BASE_URL", "https://api.binance.com")
         conn_str = get_env("AzureWebJobsStorage", required=True)
 
-        # --- DEBUG LOGS: co opravdu vidíme ---
+        # --- DEBUG LOGS ---
         logger.info(f"Symbols parsed (input): {symbols}")
         logger.info(f"Interval: {interval_str} ({INTERVAL_MIN} min)")
         logger.info(f"Blob container: {container_name}")
@@ -431,7 +407,7 @@ def main(mytimer: func.TimerRequest) -> None:
         for sym, path in preview_blob_paths(symbols, interval_str, blob_dir, blob_name_tmpl):
             logger.info(f"RESOLVED PATH -> {sym}: '{path}'")
 
-        # ---- NOVÉ: filtr na existující páry (TRADING) ----
+        # ---- filtr na existující páry (TRADING) ----
         valid_symbols = []
         skipped_symbols = []
         for s in symbols:
@@ -491,6 +467,5 @@ def main(mytimer: func.TimerRequest) -> None:
             "BINANCE_SYMBOLS","BINANCE_SYMBOL","BINANCE_INTERVAL",
             "BLOB_CONTAINER","BLOB_NAME_TEMPLATE","BLOB_DIR","START_DATE_UTC"
         ]})
-        logger.exception(e)  # <-- vypíše celý stack trace
-        # Pro jistotu znovu vyhodíme, aby se v Portálu zobrazilo "Failed"
+        logger.exception(e)
         raise
