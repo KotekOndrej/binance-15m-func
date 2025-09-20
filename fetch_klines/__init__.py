@@ -1,4 +1,4 @@
-import os 
+import os
 import time
 import json
 import logging
@@ -12,15 +12,14 @@ from dateutil import parser as dateparser
 from azure.storage.blob import BlobServiceClient, ContainerClient, BlobClient
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 
+# ------------------- Bezpečné logování ENV -------------------
 SENSITIVE_KEYS = {"AzureWebJobsStorage", "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING",
                   "WEBSITE_RUN_FROM_PACKAGE", "APPINSIGHTS_INSTRUMENTATIONKEY"}
 
 def safe_env():
     out = {}
     for k, v in os.environ.items():
-        if k in SENSITIVE_KEYS:
-            out[k] = "<redacted>"
-        elif "KEY" in k.upper() or "SECRET" in k.upper() or "PASSWORD" in k.upper():
+        if k in SENSITIVE_KEYS or "KEY" in k.upper() or "SECRET" in k.upper() or "PASSWORD" in k.upper():
             out[k] = "<redacted>"
         else:
             out[k] = v
@@ -34,13 +33,12 @@ def preview_blob_paths(symbols, interval_str, blob_dir, blob_name_tmpl):
         paths.append((s, p))
     return paths
 
-# ---- Konstanty / výchozí hodnoty ----
+# ------------------- Konstanty -------------------
 BINANCE_LIMIT = 1000
 SLEEP_SEC = 0.2
-DEFAULT_GLOBAL_TIME_BUDGET_SEC = 500   # ~8m20s
-DEFAULT_SYMBOL_TIME_BUDGET_SEC = 120   # 2 min na symbol
+DEFAULT_GLOBAL_TIME_BUDGET_SEC = 500
+DEFAULT_SYMBOL_TIME_BUDGET_SEC = 120
 
-# Hlavičky
 BASE_HEADER = "openTime,open,high,low,close,volume,closeTime,quoteVolume,numTrades,takerBuyBase,takerBuyQuote,ignore"
 NEW_HEADER = BASE_HEADER + ",closeTimeISO"
 
@@ -48,7 +46,7 @@ logger = logging.getLogger("fetch_klines")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-# ---------- Pomocné časové ----------
+# ------------------- Časové pomocné -------------------
 def to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
@@ -63,7 +61,7 @@ def floor_to_interval(dt: datetime, minutes: int) -> datetime:
     return dt.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=m)
 
 def interval_to_minutes(interval_str: str) -> int:
-    """Podporuje 'Xm','Xh','Xd','Xw','XM' (M ~30d pro zarovnání)."""
+    """Podporuje 'Xm','Xh','Xd','Xw','XM' (M ~30d)."""
     if not interval_str or len(interval_str) < 2:
         raise RuntimeError(f"Invalid BINANCE_INTERVAL: {interval_str!r}")
     unit = interval_str[-1]
@@ -80,7 +78,7 @@ def interval_to_minutes(interval_str: str) -> int:
         return val * 60 * 24 * 30
     raise RuntimeError(f"Unsupported interval unit in BINANCE_INTERVAL: {interval_str!r}")
 
-# ---------- Env ----------
+# ------------------- ENV -------------------
 def get_env(name: str, default: str = None, required: bool = False) -> str:
     val = os.getenv(name, default)
     if required and (val is None or str(val).strip() == ""):
@@ -111,7 +109,7 @@ def parse_symbols(env_val: str) -> list[str]:
             seen.add(s); res.append(s)
     return res
 
-# ---------- Binance HTTP s retry ----------
+# ------------------- Binance HTTP + retry -------------------
 def binance_get(url: str, params: dict, max_attempts: int = 6):
     backoff = 0.5
     last_err = None
@@ -137,11 +135,11 @@ def fetch_klines(base_url: str, symbol: str, interval_str: str, start_ms: int, e
     params = {"symbol": symbol, "interval": interval_str, "limit": limit, "startTime": start_ms, "endTime": end_ms}
     return binance_get(url, params)
 
-# ---------- Ověření existence symbolu ----------
+# ------------------- Ověření symbolu -------------------
 def symbol_exists(base_url: str, symbol: str) -> bool:
     """
-    True, pokud symbol existuje na Binance Spot a je v statusu TRADING.
-    Pokud Binance vrátí 400 (neznámý symbol) nebo jiný stav, vrací False.
+    True, pokud symbol existuje na Binance Spot a má status TRADING.
+    400 => symbol neexistuje.
     """
     url = f"{base_url}/api/v3/exchangeInfo"
     try:
@@ -162,7 +160,7 @@ def symbol_exists(base_url: str, symbol: str) -> bool:
         logger.warning(f"symbol_exists: Unexpected error for {symbol}: {e}")
         return False
 
-# ---------- Block Blob append (jen stage+commit, nikdy upload_blob) ----------
+# ------------------- Azure Blob helpers -------------------
 def _ensure_container(container: ContainerClient):
     try:
         container.create_container()
@@ -177,10 +175,13 @@ def _blob_exists(blob: BlobClient) -> bool:
         return False
 
 def _put_full_body_as_single_block(blob: BlobClient, data_bytes: bytes):
+    """
+    Bezpečné přepsání celého obsahu blobu jedním blokem (vytvoření/migrace/fallback).
+    """
     import base64, secrets
     block_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
     blob.stage_block(block_id=block_id, data=data_bytes)
-    # Pozn.: commit pouze s list[str] (base64 IDs)
+    # Commit pouze s list[str] -> přepíše celý block list konzistentně
     blob.commit_block_list([block_id])
 
 def _create_block_blob_with_header(blob: BlobClient, header_line: str):
@@ -246,37 +247,69 @@ def _ensure_header_present_and_migrate(blob: BlobClient):
         pass
 
 def _append_block_blob(blob: BlobClient, payload_bytes: bytes):
+    """
+    Primární režim: append přes staged block + commit s (předchozími + novým) IDs.
+    Fallback: když nezjistíme committed bloky, stáhneme stávající obsah a uložíme vše jedním blokem.
+    Tím se zabrání ztrátě hlavičky i dat (žádný 'InvalidBlockList').
+    """
     import base64, secrets
+    try:
+        # 1) pokus o načtení committed block IDs
+        bl = blob.get_block_list(block_list_type="committed")
+        committed_ids: list[str] = []
+        if bl:
+            blocks = getattr(bl, "committed_blocks", None) or []
+            for b in blocks:
+                bid = getattr(b, "id", None) or getattr(b, "name", None)
+                if isinstance(bid, bytes):
+                    bid = bid.decode("ascii")
+                if isinstance(bid, str) and bid.strip():
+                    committed_ids.append(bid)
 
-    # 1) načti committed block IDs jako čisté stringy
-    bl = blob.get_block_list(block_list_type="committed")
-    committed_ids: list[str] = []
-    if bl:
-        blocks = getattr(bl, "committed_blocks", None) or []
-        for b in blocks:
-            bid = getattr(b, "id", None) or getattr(b, "name", None)
-            if isinstance(bid, bytes):
-                bid = bid.decode("ascii")
-            if isinstance(bid, str) and bid.strip():
-                committed_ids.append(bid)
+        if committed_ids:
+            new_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+            blob.stage_block(block_id=new_id, data=payload_bytes)
+            blob.commit_block_list(committed_ids + [new_id])
+            return
 
-    # 2) stage nového bloku
-    new_id = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
-    blob.stage_block(block_id=new_id, data=payload_bytes)
+        # 2) fallback – stáhni existující obsah a přepiš jedním blokem (append efekt)
+        existing = b""
+        try:
+            props = blob.get_blob_properties()
+            if (props.size or 0) > 0:
+                existing = blob.download_blob().readall()
+        except ResourceNotFoundError:
+            existing = b""
 
-    # 3) commit – pošli list[str] včetně všech předchozích + nový
-    new_list_ids = committed_ids + [new_id]
-    blob.commit_block_list(new_list_ids)
+        combined = existing + payload_bytes
+        _put_full_body_as_single_block(blob, combined)
+
+    except Exception as e:
+        # Poslední záchrana: nikdy nenech ztratit data
+        try:
+            existing = b""
+            try:
+                props = blob.get_blob_properties()
+                if (props.size or 0) > 0:
+                    existing = blob.download_blob().readall()
+            except ResourceNotFoundError:
+                existing = b""
+            combined = existing + payload_bytes
+            _put_full_body_as_single_block(blob, combined)
+            logger.warning(f"{blob.blob_name}: append fallback overwrite used due to error: {e}")
+        except Exception as e2:
+            logger.error(f"{blob.blob_name}: append failed hard: {e2}")
+            raise
 
 def kline_to_csv_line(k):
     return ",".join([str(k[i]) for i in range(12)] + [iso_utc(int(k[6]))]) + "\n"
 
-# ---------- Pomocné: výpočet názvu blobu pro symbol ----------
+# ------------------- Pomocné: blob cesta -------------------
 def _blob_path_for(symbol: str, interval_str: str, blob_dir: str, blob_name_tmpl: str) -> str:
     blob_file = blob_name_tmpl.replace("{SYMBOL}", symbol).replace("{INTERVAL}", interval_str)
     return f"{blob_dir.strip('/ ')}/{blob_file}" if blob_dir.strip() else blob_file
 
-# ---------- Zpracování JEDNOHO symbolu s časovým budgetem ----------
+# ------------------- Zpracování jednoho symbolu -------------------
 def process_symbol(symbol: str,
                    interval_str: str,
                    container: ContainerClient,
@@ -287,7 +320,7 @@ def process_symbol(symbol: str,
                    INTERVAL_MIN: int,
                    target_end_ms: int,
                    time_budget_sec: int) -> int:
-    # Bezpečnostní brzda – kdyby se někde volalo mimo hlavní filtr
+    # Bezpečnostní brzda – jistota, že CSV nevznikne pro neplatný symbol
     if not symbol_exists(base_url, symbol):
         logger.info(f"{symbol}: not found or not trading on Binance – skipping (no CSV).")
         return 0
@@ -298,13 +331,13 @@ def process_symbol(symbol: str,
     blob_path = _blob_path_for(symbol, interval_str, blob_dir, blob_name_tmpl)
     blob: BlobClient = container.get_blob_client(blob_path)
 
-    # CSV vytvoříme jen pro platný symbol:
+    # CSV pouze pro platný symbol
     if not _blob_exists(blob):
         _create_block_blob_with_header(blob, NEW_HEADER)
     _ensure_block_blob_type(blob)
     _ensure_header_present_and_migrate(blob)
 
-    # Najdi start_ms
+    # Najdi start_ms (od posledního closeTime)
     start_ms = None
     try:
         props = blob.get_blob_properties()
@@ -329,7 +362,7 @@ def process_symbol(symbol: str,
         logger.info(f"{symbol}: Up to date – nothing to fetch. (blob={blob.blob_name})")
         return 0
 
-    logger.info(f"{symbol}: start={from_ms(start_ms)} end={from_ms(target_end_ms)} interval={interval_str} budget={time_budget_sec}s -> blob={blob.blob_name}")
+    logger.info(f"{symbol}: start={from_ms(start_ms)} end={from_ms(target_end_ms)} interval={interval_str} -> blob={blob.blob_name}")
     try:
         ping = requests.get(f"{base_url}/api/v3/ping", timeout=10)
         if ping.status_code != 200:
@@ -359,6 +392,8 @@ def process_symbol(symbol: str,
 
         if rows:
             payload = "".join(rows).encode("utf-8")
+            # Před appendem ještě jednou zajisti header (idempotentní)
+            _ensure_header_present_and_migrate(blob)
             _append_block_blob(blob, payload)
             added = len(rows)
             fetched_total += added
@@ -372,10 +407,10 @@ def process_symbol(symbol: str,
     logger.info(f"{symbol}: TOTAL appended {fetched_total} rows -> {blob.blob_name}")
     return fetched_total
 
-# ---------- Hlavní ----------
+# ------------------- Hlavní vstup -------------------
 def main(mytimer: func.TimerRequest) -> None:
     try:
-        # ---- načti symboly ----
+        # Symboly
         symbols_env = get_env("BINANCE_SYMBOLS", "")
         symbols = parse_symbols(symbols_env)
         if not symbols:
@@ -399,7 +434,7 @@ def main(mytimer: func.TimerRequest) -> None:
         base_url = get_env("BINANCE_BASE_URL", "https://api.binance.com")
         conn_str = get_env("AzureWebJobsStorage", required=True)
 
-        # --- DEBUG LOGS ---
+        # DEBUG
         logger.info(f"Symbols parsed (input): {symbols}")
         logger.info(f"Interval: {interval_str} ({INTERVAL_MIN} min)")
         logger.info(f"Blob container: {container_name}")
@@ -407,9 +442,8 @@ def main(mytimer: func.TimerRequest) -> None:
         for sym, path in preview_blob_paths(symbols, interval_str, blob_dir, blob_name_tmpl):
             logger.info(f"RESOLVED PATH -> {sym}: '{path}'")
 
-        # ---- filtr na existující páry (TRADING) ----
-        valid_symbols = []
-        skipped_symbols = []
+        # Ověření symbolů
+        valid_symbols, skipped_symbols = [], []
         for s in symbols:
             if symbol_exists(base_url, s):
                 valid_symbols.append(s)
@@ -422,17 +456,17 @@ def main(mytimer: func.TimerRequest) -> None:
             logger.error("No valid Binance symbols to process after verification. Exiting.")
             return
 
-        # ---- časový cíl ----
+        # Časový cíl (poslední uzavřená svíčka)
         now_utc = datetime.now(timezone.utc)
         last_closed = floor_to_interval(now_utc, INTERVAL_MIN) - timedelta(minutes=INTERVAL_MIN)
         target_end_ms = to_ms(last_closed) + (INTERVAL_MIN * 60 * 1000) - 1
 
-        # ---- Blob klient ----
+        # Blob klient
         blob_service = BlobServiceClient.from_connection_string(conn_str)
         container = blob_service.get_container_client(container_name)
         _ensure_container(container)
 
-        # Pre-init: CSV vytvoříme **pouze** pro ověřené symboly
+        # Pre-init CSV pouze pro validní symboly
         for s in valid_symbols:
             path = _blob_path_for(s, interval_str, blob_dir, blob_name_tmpl)
             blob = container.get_blob_client(path)
@@ -458,10 +492,10 @@ def main(mytimer: func.TimerRequest) -> None:
             )
             total_rows += added
             time.sleep(0.2)
+
         logger.info(f"ALL DONE: {len(valid_symbols)} symbols processed, total rows appended: {total_rows}")
 
     except Exception as e:
-        # Kompletní traceback do logu
         logger.error("UNHANDLED EXCEPTION in main()")
         logger.error("Environment snapshot (safe): %s", {k: safe_env().get(k) for k in [
             "BINANCE_SYMBOLS","BINANCE_SYMBOL","BINANCE_INTERVAL",
