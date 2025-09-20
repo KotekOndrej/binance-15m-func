@@ -1,4 +1,4 @@
-import os
+import os 
 import time
 import json
 import logging
@@ -137,6 +137,33 @@ def fetch_klines(base_url: str, symbol: str, interval_str: str, start_ms: int, e
     url = f"{base_url}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval_str, "limit": limit, "startTime": start_ms, "endTime": end_ms}
     return binance_get(url, params)
+
+# ---------- NOVÉ: ověření existence symbolu ----------
+def symbol_exists(base_url: str, symbol: str) -> bool:
+    """
+    True, pokud symbol existuje na Binance Spot a je v statusu TRADING.
+    Pokud Binance vrátí 400 (neznámý symbol) nebo jiný stav, vrací False.
+    """
+    url = f"{base_url}/api/v3/exchangeInfo"
+    try:
+        r = requests.get(url, params={"symbol": symbol}, timeout=15)
+        if r.status_code == 400:
+            # neexistující ticker => přeskočit
+            return False
+        r.raise_for_status()
+        data = r.json()
+        syms = data.get("symbols", [])
+        if not syms:
+            return False
+        s0 = syms[0]
+        return (s0.get("symbol") == symbol) and (s0.get("status") == "TRADING")
+    except RequestException as e:
+        logger.warning(f"symbol_exists: RequestException for {symbol}: {e}")
+        # být konzervativní – když si nejsme jistí, raději symbol vynecháme
+        return False
+    except Exception as e:
+        logger.warning(f"symbol_exists: Unexpected error for {symbol}: {e}")
+        return False
 
 # ---------- Block Blob append (jen stage+commit, nikdy upload_blob) ----------
 def _ensure_container(container: ContainerClient):
@@ -277,22 +304,6 @@ def _blob_path_for(symbol: str, interval_str: str, blob_dir: str, blob_name_tmpl
     blob_file = blob_name_tmpl.replace("{SYMBOL}", symbol).replace("{INTERVAL}", interval_str)
     return f"{blob_dir.strip('/ ')}/{blob_file}" if blob_dir.strip() else blob_file
 
-# ---------- Pre-init: vytvoř CSV s hlavičkou pro VŠECHNY symboly ----------
-def _pre_init_all_symbols(symbols, interval_str, container: ContainerClient, blob_dir, blob_name_tmpl):
-    created = 0
-    for s in symbols:
-        path = _blob_path_for(s, interval_str, blob_dir, blob_name_tmpl)
-        blob = container.get_blob_client(path)
-        if not _blob_exists(blob):
-            logger.info(f"Pre-init: creating CSV for {s} at '{path}'")
-            _create_block_blob_with_header(blob, NEW_HEADER)
-        else:
-            logger.info(f"Pre-init: CSV already exists for {s} at '{path}'")
-        _ensure_block_blob_type(blob)
-        _ensure_header_present_and_migrate(blob)
-        created += 1
-    logger.info(f"Pre-init done for {created} symbols.")
-
 # ---------- Zpracování JEDNOHO symbolu s časovým budgetem ----------
 def process_symbol(symbol: str,
                    interval_str: str,
@@ -304,13 +315,18 @@ def process_symbol(symbol: str,
                    INTERVAL_MIN: int,
                    target_end_ms: int,
                    time_budget_sec: int) -> int:
+    # Bezpečnostní brzda – kdyby se někde volalo mimo hlavní filtr
+    if not symbol_exists(base_url, symbol):
+        logger.info(f"{symbol}: not found or not trading on Binance – skipping (no CSV).")
+        return 0
+
     start_exec = time.time()
     interval_ms = INTERVAL_MIN * 60 * 1000
 
     blob_path = _blob_path_for(symbol, interval_str, blob_dir, blob_name_tmpl)
     blob: BlobClient = container.get_blob_client(blob_path)
 
-    # (pre-init už to udělal) – pro jistotu necháme idempotentní kontroly
+    # CSV vytvoříme jen pro platný symbol:
     if not _blob_exists(blob):
         _create_block_blob_with_header(blob, NEW_HEADER)
     _ensure_block_blob_type(blob)
@@ -387,7 +403,7 @@ def process_symbol(symbol: str,
 # ---------- Hlavní ----------
 def main(mytimer: func.TimerRequest) -> None:
     try:
-        # ---- načti symboly (stejně jako dřív) ----
+        # ---- načti symboly ----
         symbols_env = get_env("BINANCE_SYMBOLS", "")
         symbols = parse_symbols(symbols_env)
         if not symbols:
@@ -408,24 +424,40 @@ def main(mytimer: func.TimerRequest) -> None:
         conn_str = get_env("AzureWebJobsStorage", required=True)
 
         # --- DEBUG LOGS: co opravdu vidíme ---
-        logger.info(f"Symbols parsed: {symbols}")
+        logger.info(f"Symbols parsed (input): {symbols}")
         logger.info(f"Interval: {interval_str} ({INTERVAL_MIN} min)")
         logger.info(f"Blob container: {container_name}")
         logger.info(f"Blob dir: '{blob_dir}', name template: '{blob_name_tmpl}'")
         for sym, path in preview_blob_paths(symbols, interval_str, blob_dir, blob_name_tmpl):
             logger.info(f"RESOLVED PATH -> {sym}: '{path}'")
 
-        # ---- zbytek tvé původní main logiky beze změny ----
+        # ---- NOVÉ: filtr na existující páry (TRADING) ----
+        valid_symbols = []
+        skipped_symbols = []
+        for s in symbols:
+            if symbol_exists(base_url, s):
+                valid_symbols.append(s)
+            else:
+                skipped_symbols.append(s)
+
+        if skipped_symbols:
+            logger.warning(f"Skipping non-existing/non-trading symbols (no CSV will be created): {skipped_symbols}")
+        if not valid_symbols:
+            logger.error("No valid Binance symbols to process after verification. Exiting.")
+            return
+
+        # ---- časový cíl ----
         now_utc = datetime.now(timezone.utc)
         last_closed = floor_to_interval(now_utc, INTERVAL_MIN) - timedelta(minutes=INTERVAL_MIN)
         target_end_ms = to_ms(last_closed) + (INTERVAL_MIN * 60 * 1000) - 1
 
+        # ---- Blob klient ----
         blob_service = BlobServiceClient.from_connection_string(conn_str)
         container = blob_service.get_container_client(container_name)
         _ensure_container(container)
 
-        # Pre-init: vytvoř CSV pro všechny symboly (ať vzniknou soubory hned)
-        for s in symbols:
+        # Pre-init: CSV vytvoříme **pouze** pro ověřené symboly
+        for s in valid_symbols:
             path = _blob_path_for(s, interval_str, blob_dir, blob_name_tmpl)
             blob = container.get_blob_client(path)
             if not _blob_exists(blob):
@@ -435,7 +467,7 @@ def main(mytimer: func.TimerRequest) -> None:
             _ensure_header_present_and_migrate(blob)
 
         total_rows = 0
-        for s in symbols:
+        for s in valid_symbols:
             added = process_symbol(
                 symbol=s,
                 interval_str=interval_str,
@@ -450,7 +482,7 @@ def main(mytimer: func.TimerRequest) -> None:
             )
             total_rows += added
             time.sleep(0.2)
-        logger.info(f"ALL DONE: {len(symbols)} symbols, total rows appended: {total_rows}")
+        logger.info(f"ALL DONE: {len(valid_symbols)} symbols processed, total rows appended: {total_rows}")
 
     except Exception as e:
         # Kompletní traceback do logu
