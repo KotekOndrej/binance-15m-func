@@ -1,14 +1,13 @@
 import os
 import time
-import json
 import logging
 from datetime import datetime, timezone, timedelta
 import csv
 import io
+from typing import List, Tuple, Optional
 
 import azure.functions as func
 import requests
-from requests.exceptions import RequestException
 from dateutil import parser as dateparser
 
 from azure.storage.blob import BlobServiceClient, ContainerClient, BlobClient
@@ -16,14 +15,14 @@ from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 
 # ------------------- Konstanty -------------------
 BINANCE_LIMIT = 1000
-SLEEP_SEC = 0.2
 BASE_HEADER = "openTime,open,high,low,close,volume,closeTime,quoteVolume,numTrades,takerBuyBase,takerBuyQuote,ignore"
 NEW_HEADER = BASE_HEADER + ",closeTimeISO"
 
-# VŽDY POUŽÍT 1D
+# VŽDY 1D
 FIXED_INTERVAL_STR = "1d"
 FIXED_INTERVAL_MIN = 60 * 24  # 1440
 
+# Container s výstupy (CSV klines) a Storage
 logger = logging.getLogger("fetch_klines")
 logging.basicConfig(level=logging.INFO)
 
@@ -144,18 +143,36 @@ def _truthy(val) -> bool:
     s = str(val).strip().lower()
     return s in ("1", "true", "yes", "y")
 
-def load_active_base_tokens(blob_service: BlobServiceClient, container_name: str, csv_path: str) -> list[str]:
-    """
-    Čte models-recalc/CoinDeskModels.csv a vrací seznam unikátních základních tickerů (např. 'BTC'),
-    pro které je is_active == true. (Dedup zachovává pořadí výskytu.)
-    """
-    blob = blob_service.get_blob_client(container=container_name, blob=csv_path)
-    try:
-        raw = blob.download_blob().readall()
-    except ResourceNotFoundError:
-        raise RuntimeError(f"CSV s modely nenalezen: {csv_path}")
+def _try_download_csv(blob_service: BlobServiceClient, attempts: List[Tuple[str, str]]) -> Optional[bytes]:
+    for container_name, csv_path in attempts:
+        try:
+            blob = blob_service.get_blob_client(container=container_name, blob=csv_path)
+            raw = blob.download_blob().readall()
+            logger.info(f"Loaded models CSV from: container='{container_name}', blob='{csv_path}'")
+            return raw
+        except ResourceNotFoundError:
+            logger.warning(f"Models CSV not found at container='{container_name}', blob='{csv_path}'")
+        except Exception as ex:
+            logger.warning(f"Models CSV error at container='{container_name}', blob='{csv_path}': {ex}")
+    return None
 
-    text = raw.decode("utf-8", errors="replace")
+def load_active_base_tokens(blob_service: BlobServiceClient) -> list[str]:
+    """
+    Čte CSV s modely natvrdo z containeru 'models-recalc'.
+    Primární cesta: 'CoinDeskModels.csv' (kořen containeru).
+    Záložní: 'models-recalc/CoinDeskModels.csv' (uvnitř stejného containeru).
+    Vrací unikátní tickery (např. 'BTC') s is_active == true.
+    """
+    attempts = [
+        ("models-recalc", "CoinDeskModels.csv"),
+        ("models-recalc", "models-recalc/CoinDeskModels.csv"),
+    ]
+    raw = _try_download_csv(blob_service, attempts)
+    if raw is None:
+        tried = [f"{c}/{p}" for c, p in attempts]
+        raise RuntimeError("CSV s modely nenalezen. Zkoušené cesty: " + " | ".join(tried))
+
+    text = raw.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
 
     fieldnames = [f.lower() for f in (reader.fieldnames or [])]
@@ -194,6 +211,7 @@ def process_symbol(symbol: str,
                    INTERVAL_MIN: int,
                    target_end_ms: int) -> int:
     if not symbol_exists(base_url, symbol):
+        logger.warning(f"Symbol neexistuje nebo není TRADING: {symbol}")
         return 0
 
     blob_path = _blob_path_for(symbol, interval_str, blob_dir, blob_name_tmpl)
@@ -243,22 +261,25 @@ def process_symbol(symbol: str,
 # ------------------- Main -------------------
 def main(mytimer: func.TimerRequest) -> None:
     try:
-        # Povinné ENV
-        container_name = get_env("BLOB_CONTAINER", required=True)
+        # Povinné ENV pro výstup a připojení
+        container_name = get_env("BLOB_CONTAINER", required=True)  # sem zapisujeme klines
         start_date_str = get_env("START_DATE_UTC", "2020-01-01T00:00:00Z")
         base_url = get_env("BINANCE_BASE_URL", "https://api.binance.com")
         conn_str = get_env("AzureWebJobsStorage", required=True)
 
         blob_service = BlobServiceClient.from_connection_string(conn_str)
-        container = blob_service.get_container_client(container_name)
-        _ensure_container(container)
 
-        # Načti aktivní tokeny (unikátně, deduplikace uvnitř)
-        models_csv_path = "models-recalc/CoinDeskModels.csv"
-        base_tokens = load_active_base_tokens(blob_service, container_name, models_csv_path)
+        # Výstupní container
+        out_container = blob_service.get_container_client(container_name)
+        _ensure_container(out_container)
+
+        # Načti aktivní tokeny NATVRDO z containeru 'models-recalc'
+        base_tokens = load_active_base_tokens(blob_service)
         if not base_tokens:
             logger.info("V CSV nebyly nalezeny žádné aktivní tokeny.")
             return
+
+        logger.info(f"Aktivních tokenů: {len(base_tokens)} -> {base_tokens}")
 
         # Cíl pro poslední uzavřenou denní svíčku
         now_utc = datetime.now(timezone.utc)
@@ -275,7 +296,7 @@ def main(mytimer: func.TimerRequest) -> None:
             total_rows += process_symbol(
                 symbol=symbol,
                 interval_str=FIXED_INTERVAL_STR,
-                container=container,
+                container=out_container,
                 blob_dir=blob_dir,
                 blob_name_tmpl=blob_name_tmpl,
                 start_date_str=start_date_str,
